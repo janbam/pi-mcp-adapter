@@ -255,7 +255,8 @@ export function buildProxyDescription(
   desc += `  mcp({ connect: "server-name" })       → Connect to a server and refresh metadata\n`;
   desc += `  mcp({ tool: "name", args: '{"key": "value"}' })    → Call a tool (args is JSON string)\n`;
   desc += `  mcp({ action: "ui-messages" })        → Retrieve accumulated messages from completed UI sessions\n`;
-  desc += `\nMode: tool (call) > connect > describe > search > server (list) > action > nothing (status)`;
+  desc += `\nOnly one mode executes per call. Choose by passing one of: tool (call), connect, describe, search, server (list), action, or nothing (status).`;
+  desc += `\nArguments are lazy-loaded. Use \`describe\` before calling a tool for the first time to see its parameters.`;
 
   return desc;
 }
