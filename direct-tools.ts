@@ -258,7 +258,8 @@ export function buildProxyDescription(
   desc += `  mcp({ action: "ui-messages" })        → Retrieve accumulated messages from completed UI sessions\n`;
   desc += `  mcp({ action: "auth-start", server: "name" })      → Start manual OAuth and get a browser URL\n`;
   desc += `  mcp({ action: "auth-complete", server: "name", args: '{"redirectUrl":"..."}' }) → Complete manual OAuth\n`;
-  desc += `\nMode: action > tool (call) > connect > describe > search > server (list) > nothing (status)`;
+  desc += `\nOnly one mode executes per call. Choose by passing one of: tool (call), connect, describe, search, server (list), action, or nothing (status).`;
+  desc += `\nArguments are lazy-loaded. Use \`describe\` before calling a tool for the first time to see its parameters.`
 
   return desc;
 }
