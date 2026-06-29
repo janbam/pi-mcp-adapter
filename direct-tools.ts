@@ -11,7 +11,7 @@ import { maybeStartUiSession, type UiSessionRuntime } from "./ui-session.ts";
 import { formatToolName, isToolExcluded } from "./types.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
 import { authenticate, supportsOAuth } from "./mcp-auth-flow.ts";
-import { formatAuthRequiredMessage } from "./utils.ts";
+import { formatAuthRequiredMessage, getCallTimeoutMs } from "./utils.ts";
 
 const BUILTIN_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
 
@@ -371,11 +371,16 @@ export function createDirectToolExecutor(
           })
         : null;
 
-      const resultPromise = connection.client.callTool({
-        name: spec.originalName,
-        arguments: params ?? {},
-        _meta: uiSession?.requestMeta,
-      });
+      // FORK-OWNED: per-call timeout (PI_MCP_TIMEOUT, default 60000ms); reset on server progress.
+      const resultPromise = connection.client.callTool(
+        {
+          name: spec.originalName,
+          arguments: params ?? {},
+          _meta: uiSession?.requestMeta,
+        },
+        undefined,
+        { timeout: getCallTimeoutMs(), resetTimeoutOnProgress: true },
+      );
 
       const result = await resultPromise;
       uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/sdk/types.js").CallToolResult);

@@ -193,6 +193,14 @@ You can also pass only the `code` query parameter with `args: '{"code":"..."}'`.
 
 Per-server `idleTimeout` overrides the global setting.
 
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `PI_MCP_TIMEOUT` | Per-call MCP request timeout in milliseconds (default: `60000`, matching the SDK's `DEFAULT_REQUEST_TIMEOUT_MSEC`). Set to a positive integer to raise or lower the ceiling applied to every `callTool`. Progress notifications from the server reset the per-call timer. Unset uses the default; invalid values fail loud on first tool call. |
+
+> **Fork-owned.** `PI_MCP_TIMEOUT` and the per-call timeout / reset-on-progress behavior are additions in this fork (`janbam/pi-mcp-adapter`) and are not present in upstream `nicobailon/pi-mcp-adapter`. Preserve them when syncing from upstream.
+
 ### MCP Elicitation
 
 When Pi exposes dialog-capable UI, the adapter advertises form elicitation support. Forms use Pi's stock `select()` and `input()` dialogs, validate the response, and provide a review/edit step before submission. Explicit refusal maps to MCP `decline`; dismissing a dialog maps to `cancel`.

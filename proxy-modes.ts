@@ -8,7 +8,7 @@ import { lazyConnect, updateServerMetadata, updateMetadataCache, getFailureAgeSe
 import { buildToolMetadata, getToolNames, findToolByName, formatSchema } from "./tool-metadata.ts";
 import { transformMcpContent } from "./tool-registrar.ts";
 import { maybeStartUiSession, type UiSessionRuntime } from "./ui-session.ts";
-import { formatAuthRequiredMessage, truncateAtWord } from "./utils.ts";
+import { formatAuthRequiredMessage, getCallTimeoutMs, truncateAtWord } from "./utils.ts";
 import { authenticate, completeAuthFromInput, startAuth, supportsOAuth } from "./mcp-auth-flow.ts";
 
 type ProxyToolResult = AgentToolResult<Record<string, unknown>>;
@@ -851,11 +851,16 @@ export async function executeCall(
         })
       : null;
 
-    const resultPromise = connection.client.callTool({
-      name: toolMeta.originalName,
-      arguments: args ?? {},
-      _meta: uiSession?.requestMeta,
-    });
+    // FORK-OWNED: per-call timeout (PI_MCP_TIMEOUT, default 60000ms); reset on server progress.
+    const resultPromise = connection.client.callTool(
+      {
+        name: toolMeta.originalName,
+        arguments: args ?? {},
+        _meta: uiSession?.requestMeta,
+      },
+      undefined,
+      { timeout: getCallTimeoutMs(), resetTimeoutOnProgress: true },
+    );
 
     if (toolMeta.uiResourceUri) {
       const result = await resultPromise;
