@@ -93,6 +93,43 @@ export function resolveBearerToken(definition: Pick<ServerEntry, "bearerToken" |
   return definition.bearerTokenEnv ? process.env[definition.bearerTokenEnv] : undefined;
 }
 
+const DEFAULT_CALL_TIMEOUT_MS = 60_000;
+let cachedCallTimeoutMs: number | undefined;
+
+/**
+ * FORK-OWNED (janbam/pi-mcp-adapter): per-call MCP request timeout.
+ *
+ * Upstream nicobailon/pi-mcp-adapter calls `client.callTool` with no options,
+ * so the SDK's DEFAULT_REQUEST_TIMEOUT_MSEC (60000ms) applies silently and is not
+ * configurable. This fork threads a per-call `timeout` (and
+ * `resetTimeoutOnProgress: true`) into every callTool site and makes the value
+ * settable via the `PI_MCP_TIMEOUT` env var. Preserve across upstream syncs.
+ *
+ * Override with `PI_MCP_TIMEOUT` (positive integer milliseconds); unset falls
+ * back to 60000. Invalid values fail loud on first use rather than silently
+ * degrading.
+ */
+export function getCallTimeoutMs(): number {
+  if (cachedCallTimeoutMs !== undefined) return cachedCallTimeoutMs;
+  const raw = process.env.PI_MCP_TIMEOUT;
+  if (raw === undefined || raw === "") {
+    cachedCallTimeoutMs = DEFAULT_CALL_TIMEOUT_MS;
+    return cachedCallTimeoutMs;
+  }
+  // Strict integer parse: reject trailing garbage ("60abc"), fractions ("60.5"),
+  // hex ("0x10"), and scientific notation ("1e3") that parseInt/Number would
+  // otherwise coerce silently, honoring the documented fail-loud contract.
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || String(parsed) !== raw.trim()) {
+    throw new Error(
+      `Invalid PI_MCP_TIMEOUT="${raw}": expected a positive integer (milliseconds). ` +
+        `Unset to use the default (${DEFAULT_CALL_TIMEOUT_MS}ms).`,
+    );
+  }
+  cachedCallTimeoutMs = parsed;
+  return cachedCallTimeoutMs;
+}
+
 export function truncateAtWord(text: string, target: number): string {
   if (!text || text.length <= target) return text;
 

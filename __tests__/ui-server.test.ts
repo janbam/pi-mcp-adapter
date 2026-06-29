@@ -451,10 +451,11 @@ describe("UiServer", () => {
         ok: true,
         result: { content: [{ type: "text", text: "tool result" }] },
       });
-      expect(mockClient.callTool).toHaveBeenCalledWith({
-        name: "some_tool",
-        arguments: { arg1: "value1" },
-      });
+      expect(mockClient.callTool).toHaveBeenCalledWith(
+        { name: "some_tool", arguments: { arg1: "value1" } },
+        undefined,
+        expect.objectContaining({ resetTimeoutOnProgress: true }),
+      );
     });
 
     it("checks consent before calling tool", async () => {

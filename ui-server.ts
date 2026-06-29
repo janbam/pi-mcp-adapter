@@ -28,6 +28,7 @@ import {
   type UiSessionMessages,
   type UiStreamSummary,
 } from "./types.ts";
+import { getCallTimeoutMs } from "./utils.ts";
 
 const MAX_BODY_SIZE = 2 * 1024 * 1024;
 const ABANDONED_GRACE_MS = 60_000;
@@ -340,13 +341,18 @@ export async function startUiServer(options: UiServerOptions): Promise<UiServerH
         try {
           options.manager.touch(options.serverName);
           options.manager.incrementInFlight(options.serverName);
-          const result = await connection.client.callTool({
-            name: callParams.name,
-            arguments:
-              callParams.arguments && typeof callParams.arguments === "object" && !Array.isArray(callParams.arguments)
-                ? callParams.arguments
-                : {},
-          });
+          const result = await connection.client.callTool(
+            {
+              name: callParams.name,
+              arguments:
+                callParams.arguments && typeof callParams.arguments === "object" && !Array.isArray(callParams.arguments)
+                  ? callParams.arguments
+                  : {},
+            },
+            undefined,
+            // FORK-OWNED: per-call timeout (PI_MCP_TIMEOUT, default 60000ms); reset on server progress.
+            { timeout: getCallTimeoutMs(), resetTimeoutOnProgress: true },
+          );
           sendJson(res, 200, { ok: true, result });
         } finally {
           options.manager.decrementInFlight(options.serverName);
