@@ -1,9 +1,13 @@
 node_modules/
 .pi/
+conformance/results/
 *.log
 .DS_Store
 
-package-lock.json
+# This package uses npm/package-lock.json.
+bun.lock
+bun.lockb
+
 progress.md
 worker-summary.md
 worker-*.md
