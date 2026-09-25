@@ -509,11 +509,29 @@ export interface ServerEntry {
   tasks?: boolean;
   // Keep configuration visible without allowing connections or execution.
   disabled?: boolean;
+  /**
+   * Short model-facing summary of what the server does. Shown in the
+   * `mcp__<server>` namespace proxy's prompt snippet and description, and in
+   * the `mcp` gateway's `Servers:` block. Read it through
+   * `getServerDescription`, never directly. Not part of the metadata cache hash.
+   */
+  description?: string;
 }
 
 /** Only the literal boolean `true` disables a server. */
 export function isServerDisabled(definition: ServerEntry | undefined): boolean {
   return definition?.disabled === true;
+}
+
+/**
+ * The configured server description, collapsed to one line. Non-string or
+ * blank values count as absent. Pure config by design: callers render it into
+ * prompt-cached texts, so it must never fall back to runtime server metadata.
+ */
+export function getServerDescription(definition: ServerEntry | undefined): string | undefined {
+  const raw: unknown = definition?.description;
+  if (typeof raw !== "string") return undefined;
+  return raw.replace(/\s+/g, " ").trim() || undefined;
 }
 
 // Output guard tuning (settings.outputGuard object form)

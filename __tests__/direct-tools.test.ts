@@ -137,6 +137,42 @@ describe("buildProxyDescription", () => {
     expect(description).toContain("Disabled servers (enable with /mcp enable <server> and /reload): parked");
   });
 
+  it("keeps the one-line Servers list byte-identical when no usable description is configured", () => {
+    const plain: McpConfig = { mcpServers: { demo: { command: "demo" }, ghost: { command: "ghost" } } };
+    const unusable: McpConfig = {
+      mcpServers: {
+        demo: { command: "demo", description: " \n\t " },
+        ghost: { command: "ghost", description: 42 as unknown as string },
+      },
+    };
+
+    expect(buildProxyDescription(plain)).toContain("\n\nServers: demo, ghost\n\nUsage:\n");
+    expect(buildProxyDescription(unusable)).toBe(buildProxyDescription(plain));
+  });
+
+  it("lists every enabled server on its own line once any server has a description", () => {
+    const config: McpConfig = {
+      settings: { directTools: "search" },
+      mcpServers: {
+        TakeABreak: { command: "break" },
+        Exa: { command: "exa", directTools: true, description: "  Web search\n  and advanced   web search via Exa " },
+        Self: { command: "self", description: "Self-prompting for cognitive mode shifts" },
+        parked: { command: "parked", disabled: true, description: "Never shown" },
+      },
+    };
+
+    const description = buildProxyDescription(config);
+
+    // Config order, plain names for undescribed servers, one normalized line each.
+    expect(description).toContain(
+      "\n\nServers:\n- TakeABreak\n- Exa: Web search and advanced web search via Exa\n- Self: Self-prompting for cognitive mode shifts\n\n",
+    );
+    // The secondary server lists stay name-only.
+    expect(description).toContain("Search-mode servers (TakeABreak, Self):");
+    expect(description).toContain("Disabled servers (enable with /mcp enable <server> and /reload): parked\n");
+    expect(description).not.toContain("Never shown");
+  });
+
   it("omits the Servers line entirely when no servers are configured", () => {
     const config: McpConfig = { mcpServers: {} };
 
@@ -148,6 +184,13 @@ describe("buildProxyDescription", () => {
 });
 
 describe("metadata cache hashing", () => {
+  it("keeps cached metadata valid when only the description changes", () => {
+    const base = computeServerHash({ command: "node", args: ["server.js"] });
+
+    expect(computeServerHash({ command: "node", args: ["server.js"], description: "Web search" })).toBe(base);
+    expect(computeServerHash({ command: "node", args: ["server.js"], description: "Something else" })).toBe(base);
+  });
+
   it("invalidates metadata when the protocol era changes", () => {
     const legacy = computeServerHash({ command: "node" });
     const automatic = computeServerHash({ command: "node", protocolVersion: "auto" });
