@@ -3,6 +3,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync } from "
 import { dirname } from "node:path";
 import { getAgentPath } from "./agent-dir.ts";
 import { createHash } from "node:crypto";
+import { isBuiltInAgentPlugin } from "./agent-plugin-provenance.ts";
 import { getToolUiResourceUri } from "./ui-app-bridge-helpers.ts";
 import type {
   CachedPrompt,
@@ -19,7 +20,7 @@ import type {
   ToolMetadata,
   PromptMetadata,
 } from "./types.ts";
-import { createToolSelectorCandidateIndex, formatPromptCommandName, formatToolName, getToolNameCandidates, isServerDisabled, isToolAllowed, resolveToolPrefix, type ToolPrefix, type ToolSelectorCandidateIndex } from "./types.ts";
+import { createToolSelectorCandidateIndex, formatPromptCommandName, formatToolName, getToolNameCandidates, isServerDisabled, isToolAllowed, resolveToolPrefix, resolveUniqueNameOwnership, type ToolPrefix, type ToolSelectorCandidateIndex } from "./types.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
 import {
   extractToolUiStreamMode,
@@ -28,6 +29,7 @@ import {
   resolveBearerToken,
   resolveConfigPath,
   resolveServerUrl,
+  stableStringify,
 } from "./utils.ts";
 import { extractUiToolVisibility, isUiToolVisibleToModel } from "./ui-tool-visibility.ts";
 
@@ -79,29 +81,29 @@ export function saveMetadataCache(cache: MetadataCache): void {
   renameSync(tmpPath, cachePath);
 }
 
-export function computeServerHash(definition: ServerEntry): string {
+export function computeServerHash(definition: ServerEntry, environment: NodeJS.ProcessEnv = process.env): string {
   // Hash only fields that affect server identity and tool/resource output.
   // Exclude lifecycle, idleTimeout, requestTimeoutMs, debug — those are runtime behavior settings
   // that don't change which tools a server exposes.
   const identity: Record<string, unknown> = {
     command: definition.command,
     args: definition.args,
-    socket: resolveConfigPath(definition.socket),
-    env: interpolateEnvRecord(definition.env),
-    cwd: resolveConfigPath(definition.cwd),
-    url: resolveServerUrl(definition),
-    headers: interpolateEnvRecord(definition.headers),
+    socket: resolveConfigPath(definition.socket, environment),
+    env: isBuiltInAgentPlugin(definition, "env") ? definition.env : interpolateEnvRecord(definition.env, environment),
+    cwd: isBuiltInAgentPlugin(definition, "cwd") ? definition.cwd : resolveConfigPath(definition.cwd, environment),
+    url: resolveServerUrl(definition, environment),
+    headers: isBuiltInAgentPlugin(definition, "headers") ? definition.headers : interpolateEnvRecord(definition.headers, environment),
     requestHeadersCommand: definition.requestHeadersCommand
       ? {
-          command: interpolateEnvVars(definition.requestHeadersCommand.command),
-          args: definition.requestHeadersCommand.args?.map(interpolateEnvVars),
-          env: interpolateEnvRecord(definition.requestHeadersCommand.env),
+          command: interpolateEnvVars(definition.requestHeadersCommand.command, environment),
+          args: definition.requestHeadersCommand.args?.map((argument) => interpolateEnvVars(argument, environment)),
+          env: interpolateEnvRecord(definition.requestHeadersCommand.env, environment),
           timeoutMs: definition.requestHeadersCommand.timeoutMs,
         }
       : undefined,
     auth: definition.auth,
     protocolVersion: definition.protocolVersion,
-    bearerToken: resolveBearerToken(definition),
+    bearerToken: resolveBearerToken(definition, environment),
     bearerTokenEnv: definition.bearerTokenEnv,
     exposeResources: definition.exposeResources,
     includeTools: definition.includeTools,
@@ -114,16 +116,24 @@ export function computeServerHash(definition: ServerEntry): string {
 export function isServerCacheValid(
   entry: ServerCacheEntry,
   definition: ServerEntry,
-  maxAgeMs: number = CACHE_MAX_AGE_MS
+  maxAgeMs: number = CACHE_MAX_AGE_MS,
+  environment: NodeJS.ProcessEnv = process.env,
 ): boolean {
   let configHash: string;
   try {
-    configHash = computeServerHash(definition);
+    configHash = computeServerHash(definition, environment);
   } catch {
     return false;
   }
   if (!entry || entry.configHash !== configHash) return false;
   if (!entry.cachedAt || typeof entry.cachedAt !== "number") return false;
+  const declaredTtlMs = entry.ttlMs;
+  if (typeof declaredTtlMs === "number" && Number.isSafeInteger(declaredTtlMs) && declaredTtlMs >= 0) {
+    if (declaredTtlMs === 0) return false;
+    const ageMs = Date.now() - entry.cachedAt;
+    const effectiveMaxAge = maxAgeMs > 0 ? Math.min(maxAgeMs, declaredTtlMs) : declaredTtlMs;
+    return ageMs < effectiveMaxAge;
+  }
   if (maxAgeMs > 0 && Date.now() - entry.cachedAt > maxAgeMs) return false;
   return true;
 }
@@ -192,7 +202,6 @@ export function reconstructToolMetadata(
   sharedSelectorCandidateIndex?: ToolSelectorCandidateIndex,
 ): ToolMetadata[] {
   const metadata: ToolMetadata[] = [];
-  const seenNames = new Set<string>();
   const effectivePrefix = resolveToolPrefix(definition, prefix);
   const hasToolFilters =
     (Array.isArray(definition.includeTools) && definition.includeTools.length > 0) ||
@@ -213,16 +222,12 @@ export function reconstructToolMetadata(
     }
 
     const name = formatToolName(tool.name, serverName, effectivePrefix);
-    if (seenNames.has(name)) {
-      continue;
-    }
-    seenNames.add(name);
-
     metadata.push({
       name,
       originalName: tool.name,
       description: tool.description ?? "",
       ...(tool.inputSchema !== undefined ? { inputSchema: tool.inputSchema } : {}),
+      ...(tool.outputSchema !== undefined ? { outputSchema: tool.outputSchema } : {}),
       ...(tool.uiResourceUri !== undefined ? { uiResourceUri: tool.uiResourceUri } : {}),
       ...(tool.uiVisibility !== undefined ? { uiVisibility: tool.uiVisibility } : {}),
       ...(tool.uiStreamMode !== undefined ? { uiStreamMode: tool.uiStreamMode } : {}),
@@ -238,11 +243,6 @@ export function reconstructToolMetadata(
       }
 
       const name = formatToolName(baseName, serverName, effectivePrefix);
-      if (seenNames.has(name)) {
-        continue;
-      }
-      seenNames.add(name);
-
       metadata.push({
         name,
         originalName: baseName,
@@ -252,7 +252,7 @@ export function reconstructToolMetadata(
     }
   }
 
-  return metadata;
+  return resolveUniqueNameOwnership(metadata, (tool) => tool.name).unique;
 }
 
 export function createCachedToolSelectorCandidateIndex(
@@ -290,6 +290,7 @@ export function serializeTools(tools: McpTool[]): CachedTool[] {
         name: t.name,
         ...(t.description !== undefined ? { description: t.description } : {}),
         ...(t.inputSchema !== undefined ? { inputSchema: t.inputSchema } : {}),
+        ...(t.outputSchema !== undefined ? { outputSchema: t.outputSchema } : {}),
         ...(uiResourceUri !== undefined ? { uiResourceUri } : {}),
         ...(uiVisibility !== undefined ? { uiVisibility } : {}),
         ...(uiStreamMode !== undefined ? { uiStreamMode } : {}),
@@ -350,19 +351,6 @@ export function reconstructPromptMetadata(
       arguments: args,
     };
   });
-}
-
-function stableStringify(value: unknown): string {
-  if (value === null || value === undefined || typeof value !== "object") {
-    const serialized = JSON.stringify(value);
-    return serialized === undefined ? "undefined" : serialized;
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(v => stableStringify(v)).join(",")}]`;
-  }
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
 }
 
 function tryGetToolUiResourceUri(tool: McpTool): string | undefined {

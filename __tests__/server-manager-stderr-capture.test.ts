@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { PassThrough } from "node:stream";
 
 const mocks = vi.hoisted(() => ({
@@ -85,6 +88,26 @@ describe("McpServerManager stderr capture", () => {
     expect(mocks.transports[0].options.args).toEqual(["--first=interpolated", "--second=interpolated"]);
   });
 
+  it("reports an invalid stdio cwd instead of blaming the command", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-mcp-cwd-"));
+    const missingCwd = join(root, "missing");
+    const fileCwd = join(root, "file");
+    writeFileSync(fileCwd, "");
+
+    try {
+      const { McpServerManager } = await import("../server-manager.ts");
+      const manager = new McpServerManager();
+
+      await expect(manager.connect("missing", { command: "missing-command", cwd: missingCwd }))
+        .rejects.toThrow(`MCP server "missing" configured cwd does not exist: "${missingCwd}"`);
+      await expect(manager.connect("file", { command: "missing-command", cwd: fileCwd }))
+        .rejects.toThrow(`MCP server "file" configured cwd is not a directory: "${fileCwd}"`);
+      expect(mocks.transports).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("passes interpolated npx arguments to the resolver", async () => {
     process.env.MCP_TEST_STDIO_ARG = "interpolated";
     const { McpServerManager } = await import("../server-manager.ts");
@@ -104,6 +127,23 @@ describe("McpServerManager stderr capture", () => {
       command: "npx",
       args: ["-y", "demo-pkg", "--token=interpolated"],
     });
+  });
+
+  it("validates cwd before resolving npx binaries", async () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-mcp-cwd-"));
+    const missingCwd = join(root, "missing");
+
+    try {
+      const { McpServerManager } = await import("../server-manager.ts");
+      const manager = new McpServerManager();
+
+      await expect(manager.connect("missing", { command: "npx", args: ["server-pkg"], cwd: missingCwd }))
+        .rejects.toThrow(`MCP server "missing" configured cwd does not exist: "${missingCwd}"`);
+      expect(resolveNpxBinary).not.toHaveBeenCalled();
+      expect(mocks.transports).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("appends captured stderr to the connection error", async () => {
@@ -155,6 +195,20 @@ describe("McpServerManager stderr capture", () => {
     await expect(manager.connect("http", { url: "https://example.com/mcp" })).rejects.toThrow(
       /MCP error -32000: Connection closed — probe: endpoint returned HTML \(404\)/,
     );
+  });
+
+  it("leaves macOS stdio network failures unchanged without HTTP requests", async () => {
+    vi.spyOn(process, "platform", "get").mockReturnValue("darwin");
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const { McpServerManager } = await import("../server-manager.ts");
+    const manager = new McpServerManager();
+    const original = new Error("connection failed", {
+      cause: Object.assign(new Error("connect 192.168.10.7"), { code: "EHOSTUNREACH" }),
+    });
+    mocks.connectImpl = async () => { throw original; };
+    await expect(manager.connect("stdio", { command: "node" })).rejects.toBe(original);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("bounds captured stderr and keeps only its final three lines", async () => {
