@@ -1,8 +1,49 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawnSync } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir, platform } from "node:os";
-import { extname, isAbsolute, join } from "node:path";
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import stripJsonComments from "strip-json-comments";
 import type { McpConfig, ServerEntry } from "./types.ts";
+
+export function parseJsonWithComments(raw: string): unknown {
+  return JSON.parse(stripJsonComments(raw, { trailingCommas: true }));
+}
+
+/** Resolve a candidate only when its real path stays within the real root. */
+export function resolveRealContainedPath(root: string, candidate: string, allowMissing = false): string | null {
+  const contained = resolveContainedPath(root, candidate);
+  if (!contained) return null;
+  const canonical = (path: string): string => {
+    let existing = path;
+    while (allowMissing && !existsSync(existing)) {
+      const parent = dirname(existing);
+      if (parent === existing) throw new Error("No existing path ancestor");
+      existing = parent;
+    }
+    return resolve(realpathSync(existing), relative(existing, path));
+  };
+  try {
+    return resolveContainedPath(canonical(root), canonical(contained));
+  } catch {
+    return null;
+  }
+}
+
+export function resolveContainedPath(root: string, candidate: string): string | null {
+  const resolved = resolve(root, candidate);
+  const rel = relative(root, resolved);
+  return rel === "" || (!rel.startsWith("..") && !rel.startsWith(sep) && !isAbsolute(rel)) ? resolved : null;
+}
+
+export function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
+  if (Array.isArray(value)) {
+    return `[${value.map(item => stableStringify(item)).join(",")}]`;
+  }
+  const object = value as Record<string, unknown>;
+  return `{${Object.keys(object).sort().map(key => `${JSON.stringify(key)}:${stableStringify(object[key])}`).join(",")}}`;
+}
 
 async function execOpen(pi: ExtensionAPI, target: string, browser?: string, signal?: AbortSignal) {
   const os = platform();
@@ -64,25 +105,44 @@ export async function parallelLimit<T, R>(
 }
 
 export function getConfigPathFromArgv(): string | undefined {
-  const idx = process.argv.indexOf("--mcp-config");
-  if (idx >= 0 && idx + 1 < process.argv.length) {
-    return process.argv[idx + 1];
+  let configPath: string | undefined;
+  for (let index = 2; index < process.argv.length; index++) {
+    const arg = process.argv[index];
+    if (arg === undefined) continue;
+    if (arg === "--") break;
+
+    if (arg === "--mcp-config") {
+      const value = process.argv[index + 1];
+      if (value !== undefined && !value.startsWith("-") && !value.startsWith("@")) {
+        configPath = value;
+        index++;
+      } else {
+        configPath = undefined;
+      }
+      continue;
+    }
+
+    if (arg.startsWith("--mcp-config=")) {
+      configPath = arg.slice("--mcp-config=".length);
+    }
   }
-  return undefined;
+  return configPath;
 }
 
-export function interpolateEnvVars(value: string): string {
+export function interpolateEnvVars(value: string): string;
+export function interpolateEnvVars(value: string, environment: NodeJS.ProcessEnv): string;
+export function interpolateEnvVars(value: string, environment: NodeJS.ProcessEnv = process.env): string {
   return value
-    .replace(/\$\{(\w+)\}/g, (_, name) => process.env[name] ?? "")
-    .replace(/\$env:(\w+)/g, (_, name) => process.env[name] ?? "")
-    .replace(/\{env:(\w+)\}/g, (_, name) => process.env[name] ?? "");
+    .replace(/\$\{(\w+)\}/g, (_, name) => environment[name] ?? "")
+    .replace(/\$env:(\w+)/g, (_, name) => environment[name] ?? "")
+    .replace(/\{env:(\w+)\}/g, (_, name) => environment[name] ?? "");
 }
 
-function getMissingEnvVars(value: string): string[] {
+export function getMissingEnvVars(value: string, environment: NodeJS.ProcessEnv = process.env): string[] {
   const missing = new Set<string>();
   for (const match of value.matchAll(/\$\{(\w+)\}|\$env:(\w+)|\{env:(\w+)\}/g)) {
     const name = match[1] ?? match[2] ?? match[3];
-    if (name && process.env[name] === undefined) {
+    if (name && environment[name] === undefined) {
       missing.add(name);
     }
   }
@@ -99,17 +159,17 @@ export function toStringRecord(value: unknown): Record<string, string> | undefin
   return Object.keys(result).length > 0 ? result : undefined;
 }
 
-function interpolateSecretExpression(value: string): string {
-  if (value.startsWith("!!")) return interpolateEnvVars(value.slice(1));
-  return value.startsWith("!") ? value : interpolateEnvVars(value);
+function interpolateSecretExpression(value: string, environment: NodeJS.ProcessEnv): string {
+  if (value.startsWith("!!")) return interpolateEnvVars(value.slice(1), environment);
+  return value.startsWith("!") ? value : interpolateEnvVars(value, environment);
 }
 
-export function interpolateEnvRecord(values: Record<string, string> | undefined): Record<string, string> | undefined {
+export function interpolateEnvRecord(values: Record<string, string> | undefined, environment: NodeJS.ProcessEnv = process.env): Record<string, string> | undefined {
   if (!values) return undefined;
 
   return Object.fromEntries(Object.entries(values).map(([key, value]) => [
     key,
-    interpolateSecretExpression(value),
+    interpolateSecretExpression(value, environment),
   ]));
 }
 
@@ -164,18 +224,18 @@ export function resolveCommandSecretsRecord(
   ]));
 }
 
-export function resolveServerUrl(definition: Pick<ServerEntry, "url">): string | undefined {
+export function resolveServerUrl(definition: Pick<ServerEntry, "url">, environment: NodeJS.ProcessEnv = process.env): string | undefined {
   if (definition.url == null) return undefined;
   if (typeof definition.url !== "string") {
     throw new Error("MCP server URL must be a string");
   }
 
-  const missing = getMissingEnvVars(definition.url);
+  const missing = getMissingEnvVars(definition.url, environment);
   if (missing.length > 0) {
     throw new Error(`Missing environment variable${missing.length === 1 ? "" : "s"} in MCP server URL: ${missing.join(", ")}`);
   }
 
-  const resolved = interpolateEnvVars(definition.url);
+  const resolved = interpolateEnvVars(definition.url, environment);
   try {
     new URL(resolved);
   } catch (error) {
@@ -184,10 +244,10 @@ export function resolveServerUrl(definition: Pick<ServerEntry, "url">): string |
   return resolved;
 }
 
-export function resolveConfigPath(value: string | undefined): string | undefined {
+export function resolveConfigPath(value: string | undefined, environment: NodeJS.ProcessEnv = process.env): string | undefined {
   if (value === undefined) return undefined;
 
-  const resolved = interpolateEnvVars(value);
+  const resolved = interpolateEnvVars(value, environment);
   if (resolved === "~") return homedir();
   if (resolved.startsWith("~/") || resolved.startsWith("~\\")) {
     return join(homedir(), resolved.slice(2));
@@ -195,11 +255,11 @@ export function resolveConfigPath(value: string | undefined): string | undefined
   return resolved;
 }
 
-export function resolveBearerToken(definition: Pick<ServerEntry, "bearerToken" | "bearerTokenEnv">): string | undefined {
+export function resolveBearerToken(definition: Pick<ServerEntry, "bearerToken" | "bearerTokenEnv">, environment: NodeJS.ProcessEnv = process.env): string | undefined {
   if (definition.bearerToken !== undefined) {
-    return interpolateSecretExpression(definition.bearerToken);
+    return interpolateSecretExpression(definition.bearerToken, environment);
   }
-  return definition.bearerTokenEnv ? process.env[definition.bearerTokenEnv] : undefined;
+  return definition.bearerTokenEnv ? environment[definition.bearerTokenEnv] : undefined;
 }
 
 /**
@@ -401,6 +461,22 @@ export function formatAuthRequiredMessage(
 export function formatMcpStatus(config: Pick<McpConfig, "settings">, message: string): string | undefined {
   if (config.settings?.mcpFooterStatus === "off") return undefined;
   return `${config.settings?.showStatusIcon === false ? "MCP: " : "🔌 MCP: "}${message}`;
+}
+
+export function formatMcpFooterStatus(
+  config: Pick<McpConfig, "settings">,
+  enabledCount: number,
+  disabledCount: number,
+  connectedCount: number,
+): string | undefined {
+  if (enabledCount + disabledCount === 0 || config.settings?.mcpFooterStatus === "off") return undefined;
+  const footerStatus = config.settings?.mcpFooterStatus ?? "full";
+  if (footerStatus === "compact") return `MCP ${connectedCount}/${enabledCount}`;
+
+  let status = `${enabledCount} ${enabledCount === 1 ? "server" : "servers"} enabled`;
+  if (connectedCount > 0) status += ` (${connectedCount} connected)`;
+  if (disabledCount > 0) status += ` (${disabledCount} disabled)`;
+  return formatMcpStatus(config, status);
 }
 
 /**

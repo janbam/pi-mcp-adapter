@@ -1,30 +1,37 @@
+import { existsSync, readFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { OverlayHandle } from "@earendil-works/pi-tui";
 import type { McpExtensionState } from "./state.ts";
 import { isServerDisabled, type McpAuthResult, type McpConfig, type McpPanelCallbacks, type McpPanelResult, type ImportKind } from "./types.ts";
 import {
   ensureCompatibilityImports,
+  getSharedConfigPath,
   getMcpDiscoverySummary,
   getMcpStandardConfigSummary,
-  getProjectConfigPath,
   type KnownServerPreset,
+  type SharedConfigTarget,
   getServerProvenance,
   previewCompatibilityImports,
   previewSharedServerEntry,
-  previewStarterProjectConfig,
+  previewStarterSharedConfig,
   writeDirectToolsConfig,
+  writeJevSemanticSearchConfig,
+  writeProjectServerDisabledOverride,
   writeSharedServerEntry,
-  writeStarterProjectConfig,
+  writeSharedConfigText,
+  writeStarterSharedConfig,
 } from "./config.ts";
 import { markKeepAliveAfterConnect, notifyToolMetadataUpdated, updateMetadataCache, updateStatusBar, getFailureAgeSeconds, getFailureMessage, clearFailure, recordFailure } from "./init.ts";
+import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
 import { loadMetadataCache, reconstructPromptMetadata } from "./metadata-cache.ts";
 import { buildToolMetadata } from "./tool-metadata.ts";
 import { supportsOAuth, authenticate, removeAuth, type McpOAuthRuntime } from "./mcp-auth-flow.ts";
 import { getAuthStorageOptions, inspectAuthForUrl } from "./mcp-auth.ts";
 import { inspectBearerTokenForUrl, removeBearerToken } from "./mcp-bearer-store.ts";
 import { loadOnboardingState, markSetupCompleted as persistSetupCompleted, markSharedConfigHintShown } from "./onboarding-state.ts";
-import { openPath, resolveServerUrl, sanitizeTerminalText } from "./utils.ts";
+import { formatTerminalError, openPath, resolveServerUrl, sanitizeTerminalText } from "./utils.ts";
 import { isAbortError } from "./runtime-owner.ts";
+import { resolveJevCredential } from "./jev-key-store.ts";
 
 function terminalHyperlink(label: string, url: string): string {
   return `\u001B]8;;${sanitizeTerminalText(url)}\u001B\\${sanitizeTerminalText(label)}\u001B]8;;\u001B\\`;
@@ -43,10 +50,104 @@ function canRenderPanel(ctx: ExtensionContext): boolean {
   return ctx.hasUI && ctx.mode === "tui";
 }
 
+export async function editSharedConfig(ctx: ExtensionContext, target: SharedConfigTarget): Promise<boolean> {
+  if (!ctx.hasUI) return false;
+  const path = getSharedConfigPath(target, ctx.cwd);
+  const before = existsSync(path) ? readFileSync(path, "utf8") : '{\n  "mcpServers": {}\n}\n';
+  const after = await ctx.ui.editor(`Edit ${path} (Ctrl+G opens $EDITOR)`, before);
+  if (after === undefined || after === before) return false;
+  try {
+    writeSharedConfigText(path, after);
+  } catch (error) {
+    ctx.ui.notify(`MCP: not saved: ${formatTerminalError(error)}`, "error");
+    return false;
+  }
+  return true;
+}
+
+export async function setupJevSemanticSearch(
+  state: McpExtensionState,
+  ctx: ExtensionContext,
+  configOverridePath?: string,
+): Promise<boolean> {
+  if (!ctx.hasUI) return false;
+  const credential = resolveJevCredential();
+  if (credential.status !== "present") {
+    const detail = credential.status === "unavailable" ? ` ${credential.message}` : "";
+    ctx.ui.notify(
+      `Jev needs a System One API key.${detail}\nRun \`pi-mcp-adapter key set systemone\` in a terminal, then run \`/mcp jev setup\` again.`,
+      "error",
+    );
+    return false;
+  }
+
+  const servers = Object.keys(state.config.mcpServers)
+    .filter((name) => !isServerDisabled(state.config.mcpServers[name]))
+    .sort((a, b) => a.localeCompare(b));
+  if (servers.length === 0) {
+    ctx.ui.notify("Enable or add an MCP server before setting up Jev semantic search.", "error");
+    return false;
+  }
+  const configuredJev = state.config.settings?.jev;
+  const payloadDisclosure = configuredJev && configuredJev.scriptEvaluation
+    ? " Allowed servers can also be sources for script evaluations, which may send state and MCP results."
+    : " Semantic search does not send tool results.";
+
+  const choice = await ctx.ui.select("Configure Jev semantic search", [
+    `Use all ${servers.length} enabled servers (default)`,
+    "Restrict to selected servers",
+    "Cancel",
+  ]);
+  if (!choice || choice === "Cancel") return false;
+
+  let allowedServers: string[];
+  if (choice.startsWith("Use all ")) {
+    const confirmed = await ctx.ui.confirm(
+      "Share MCP tool metadata with Jev?",
+      `Semantic searches send the query text, server names, tool paths, tool names, and descriptions from ${servers.length} servers to the configured Jev endpoint.${payloadDisclosure}`,
+    );
+    if (!confirmed) return false;
+    allowedServers = servers;
+  } else {
+    allowedServers = [];
+    for (const server of servers) {
+      if (await ctx.ui.confirm(
+        `Allow ${server}?`,
+        `Semantic searches send the query text, server name, tool paths, tool names, and descriptions to the configured Jev endpoint.${payloadDisclosure}`,
+      )) allowedServers.push(server);
+    }
+    if (allowedServers.length === 0) {
+      ctx.ui.notify("Jev setup cancelled because no servers were allowed.", "info");
+      return false;
+    }
+  }
+
+  try {
+    const result = writeJevSemanticSearchConfig(configOverridePath, ctx.cwd, allowedServers, state.config.settings?.jev);
+    ctx.ui.notify(
+      result.changed
+        ? `Jev semantic search configured for ${allowedServers.length} server${allowedServers.length === 1 ? "" : "s"}. Reloading Pi…`
+        : "Jev semantic search is already configured for those servers.",
+      "info",
+    );
+    return result.changed;
+  } catch (error) {
+    ctx.ui.notify(`Jev setup failed: ${formatTerminalError(error)}`, "error");
+    return false;
+  }
+}
+
 export async function showStatus(state: McpExtensionState, ctx: ExtensionContext): Promise<void> {
   if (!ctx.hasUI) return;
 
   const lines: string[] = ["MCP Server Status:", ""];
+  if (!state.programmaticConfig) {
+    lines.push(
+      "Shared MCP config: .mcp.json for this project/team or ~/.config/mcp/mcp.json for all projects.",
+      "Pi-owned files hold compatibility imports and adapter-specific overrides.",
+      "",
+    );
+  }
 
   for (const name of Object.keys(state.config.mcpServers)) {
     const definition = state.config.mcpServers[name];
@@ -58,12 +159,22 @@ export async function showStatus(state: McpExtensionState, ctx: ExtensionContext
     const metadata = state.toolMetadata.get(name);
     const toolCount = metadata?.length ?? 0;
     const failedAgo = getFailureAgeSeconds(state, name);
-    let status = "not connected";
+    let status = "not listening (disconnected)";
     let statusIcon = "○";
     let failed = false;
 
     if (connection?.status === "connected") {
-      status = "connected";
+      status = connection.listenState === "active"
+        ? connection.listenCatalogStale
+          ? "connected; listen active; catalog may be stale"
+          : "connected; listen active"
+        : connection.listenState === "dropped"
+          ? "connected; catalog may be stale — will reconcile on next keep-alive or tool use"
+          : connection.listenState === "re-establishing"
+            ? "connected; re-establishing listen"
+            : connection.listenState === "legacy"
+              ? "connected; legacy notification path"
+              : "connected; not listening for catalog updates";
       statusIcon = "✓";
     } else if (connection?.status === "needs-auth") {
       status = "needs auth";
@@ -74,16 +185,20 @@ export async function showStatus(state: McpExtensionState, ctx: ExtensionContext
       statusIcon = "✗";
       failed = true;
     } else if (metadata !== undefined) {
-      status = "cached";
+      status = "cached; not listening (disconnected)";
     }
 
-    const toolSuffix = failed ? "" : ` (${toolCount} tools${status === "cached" ? ", cached" : ""})`;
+    const toolSuffix = failed ? "" : ` (${toolCount} tools${status.startsWith("cached") ? ", cached" : ""})`;
     lines.push(`${statusIcon} ${name}: ${status}${toolSuffix}`);
+  }
+
+  if (state.config.settings?.freezeDirectTools === true) {
+    lines.push("", "Direct tools frozen; active registrations may differ from current metadata.");
   }
 
   if (Object.keys(state.config.mcpServers).length === 0) {
     lines.push("No MCP servers configured");
-    lines.push("Run /mcp setup to adopt imports or scaffold a starter .mcp.json");
+    lines.push("Run /mcp setup to add a server to .mcp.json or ~/.config/mcp/mcp.json");
   }
 
   ctx.ui.notify(lines.join("\n"), "info");
@@ -131,6 +246,7 @@ export async function showTools(state: McpExtensionState, ctx: ExtensionContext)
 
   const allTools = [...state.toolMetadata.entries()]
     .filter(([serverName]) => !isServerDisabled(state.config.mcpServers[serverName]))
+    .filter(([serverName]) => !isServerInActiveFailureBackoff(state, serverName))
     .flatMap(([, metadata]) => metadata.map(m => m.name));
 
   if (allTools.length === 0) {
@@ -169,11 +285,11 @@ export async function reconnectServer(
   }
 
   try {
-    await state.manager.close(name);
     state.owner?.throwIfInactive();
-    const connection = signal
-      ? await state.manager.connect(name, definition, signal)
-      : await state.manager.connect(name, definition);
+    const current = state.manager.getConnection(name);
+    const connection = current
+      ? await state.manager.reconnect(name, definition, current, signal)
+      : await state.manager.connect(name, definition, signal);
     state.owner?.throwIfInactive();
     if (connection.status === "needs-auth") {
       if (ui) {
@@ -196,9 +312,9 @@ export async function reconnectServer(
       state.serverInstructions.delete(name);
     }
     updateMetadataCache(state, name);
-    notifyToolMetadataUpdated(state, name, "command-reconnect");
+    const restored = clearFailure(state, name, "command-reconnect");
+    if (!restored) notifyToolMetadataUpdated(state, name, "command-reconnect");
     markKeepAliveAfterConnect(state, name);
-    clearFailure(state, name);
 
     if (ui) {
       ui.notify(
@@ -286,16 +402,16 @@ export async function authenticateServer(
     }
 
     ui.setStatus("mcp-auth", `Authenticating ${serverName}...`);
-    const authStorageOptions = getAuthStorageOptions(config.settings?.oauthDir, cwd);
+    const authStorageOptions = getAuthStorageOptions(config.settings?.oauthDir, cwd, config.settings?.oauthCredentialStore);
     const status = await authenticate(serverName, serverUrl, definition, {
-      ...(authStorageOptions.baseDir ? { authStorageOptions } : {}),
+      ...(Object.keys(authStorageOptions).length > 0 ? { authStorageOptions } : {}),
       onAuthorizationUrl: () => {},
       onAuthorizationInput: async (authorizationUrl, inputSignal) => {
         if (inputSignal.aborted) return undefined;
         return ui.input(
           `Complete ${serverName} OAuth\n\n` +
             `${terminalHyperlink("Open authorization page", authorizationUrl)}\n${authorizationUrl}\n\n` +
-            "Approve access, then paste the full localhost callback URL below.",
+            "Approve access, then paste the full callback URL from the browser address bar below.",
           undefined,
           { signal: inputSignal },
         );
@@ -339,27 +455,24 @@ export async function logoutServer(
 
   const signal = state.owner?.signal;
   try {
-    await removeAuth(serverName, { authStorageOptions: state.authStorageOptions, signal, runtime: state.oauthRuntime });
+    await state.manager.close(serverName);
   } catch (error) {
     if (isAbortError(error, signal)) throw error;
     const message = error instanceof Error ? error.message : String(error);
     if (ui) {
-      ui.notify(`Failed to clear OAuth credentials for "${serverName}": ${sanitizeTerminalText(message)}`, "error");
+      ui.notify(`Failed to close OAuth server "${serverName}"; credentials were not cleared: ${sanitizeTerminalText(message)}`, "error");
     }
     return { ok: false, message };
   }
 
   state.owner?.throwIfInactive();
   try {
-    await state.manager.close(serverName);
+    await removeAuth(serverName, { authStorageOptions: state.authStorageOptions, signal, runtime: state.oauthRuntime });
   } catch (error) {
     if (isAbortError(error, signal)) throw error;
     const message = error instanceof Error ? error.message : String(error);
     if (ui) {
-      ui.notify(
-        `OAuth credentials were cleared for "${serverName}", but its connection could not be closed: ${sanitizeTerminalText(message)}`,
-        "error",
-      );
+      ui.notify(`Failed to clear OAuth credentials for "${serverName}": ${sanitizeTerminalText(message)}`, "error");
     }
     return { ok: false, message };
   }
@@ -448,16 +561,18 @@ export interface PanelFlowResult {
 function buildSharedConfigNoticeLines(configOverridePath: string | undefined, cwd: string): { lines: string[]; fingerprint: string | null } {
   const discovery = getMcpStandardConfigSummary(configOverridePath, cwd);
   const onboardingState = loadOnboardingState();
-  if (!discovery.hasSharedServers || onboardingState.sharedConfigHintShown) {
+  const sharedSources = discovery.sources.filter((source) =>
+    (source.id === "shared-project" || source.id === "shared-project-ancestor" || source.id === "shared-global") && source.serverCount > 0,
+  );
+  if (sharedSources.length === 0 || onboardingState.sharedConfigHintShown) {
     return { lines: [], fingerprint: null };
   }
 
-  const sharedSources = discovery.sources.filter((source) => source.kind === "shared" && source.serverCount > 0);
   const sourceList = sharedSources.map((source) => source.path).join(", ");
   return {
     lines: [
       `Using standard MCP config from ${sourceList}.`,
-      "Pi only writes compatibility imports and adapter-specific overrides into Pi-owned files when needed.",
+      "Use .mcp.json for project/team config or ~/.config/mcp/mcp.json for all projects. Pi only writes compatibility imports and adapter-specific overrides into Pi-owned files when needed.",
     ],
     fingerprint: discovery.fingerprint,
   };
@@ -488,34 +603,34 @@ export async function openMcpSetup(
 
   const callbacks = {
     previewImports: (imports: ImportKind[]) => previewCompatibilityImports(imports, configOverridePath),
-    previewStarterProject: () => previewStarterProjectConfig(ctx.cwd),
-    previewRepoPrompt: () => {
+    previewStarterConfig: (target: SharedConfigTarget) => previewStarterSharedConfig(target, ctx.cwd),
+    previewRepoPrompt: (target: SharedConfigTarget) => {
       const repoPrompt = getMcpDiscoverySummary(configOverridePath, ctx.cwd, options).repoPrompt;
       if (!repoPrompt.entry || !repoPrompt.targetPath || !repoPrompt.serverName) return null;
-      return previewSharedServerEntry(repoPrompt.targetPath, repoPrompt.serverName, repoPrompt.entry);
+      return previewSharedServerEntry(getSharedConfigPath(target, ctx.cwd), repoPrompt.serverName, repoPrompt.entry);
     },
-    previewKnownServer: (preset: KnownServerPreset) => previewSharedServerEntry(getProjectConfigPath(ctx.cwd), preset.id, preset.entry),
+    previewKnownServer: (preset: KnownServerPreset, target: SharedConfigTarget) => previewSharedServerEntry(getSharedConfigPath(target, ctx.cwd), preset.id, preset.entry),
     adoptImports: async (imports: ImportKind[]) => {
       const result = ensureCompatibilityImports(imports, configOverridePath);
       if (result.added.length > 0) configChanged = true;
       return result;
     },
-    scaffoldProjectConfig: async () => {
-      const path = writeStarterProjectConfig(ctx.cwd);
+    scaffoldConfig: async (target: SharedConfigTarget) => {
+      const path = writeStarterSharedConfig(target, ctx.cwd);
       configChanged = true;
       return { path };
     },
-    addRepoPrompt: async () => {
+    addRepoPrompt: async (target: SharedConfigTarget) => {
       const repoPrompt = getMcpDiscoverySummary(configOverridePath, ctx.cwd, options).repoPrompt;
       if (!repoPrompt.entry || !repoPrompt.targetPath || !repoPrompt.serverName) {
         throw new Error("RepoPrompt is not available to add from this setup screen.");
       }
-      const path = writeSharedServerEntry(repoPrompt.targetPath, repoPrompt.serverName, repoPrompt.entry);
+      const path = writeSharedServerEntry(getSharedConfigPath(target, ctx.cwd), repoPrompt.serverName, repoPrompt.entry);
       configChanged = true;
       return { path, serverName: repoPrompt.serverName };
     },
-    addKnownServer: async (preset: KnownServerPreset) => {
-      const path = writeSharedServerEntry(getProjectConfigPath(ctx.cwd), preset.id, preset.entry);
+    addKnownServer: async (preset: KnownServerPreset, target: SharedConfigTarget) => {
+      const path = writeSharedServerEntry(getSharedConfigPath(target, ctx.cwd), preset.id, preset.entry);
       configChanged = true;
       return { path, serverName: preset.name };
     },
@@ -529,8 +644,8 @@ export async function openMcpSetup(
 
   return new Promise<PanelFlowResult>((resolve) => {
     ctx.ui.custom(
-      (tui, _theme, keybindings, done) => {
-        return createMcpSetupPanel(discovery, callbacks, { mode, onboardingState, keybindings }, tui, () => {
+      (tui, theme, keybindings, done) => {
+        return createMcpSetupPanel(discovery, callbacks, { mode, onboardingState, keybindings, theme }, tui, () => {
           done(undefined);
           resolve({ configChanged });
         });
@@ -643,9 +758,21 @@ export async function openMcpPanel(
 
   await new Promise<void>((resolve) => {
     ctx.ui.custom(
-      (tui, _theme, keybindings, done) => {
+      (tui, theme, keybindings, done) => {
         return createMcpPanel(config, cache, provenanceMap, callbacks, tui, (result: McpPanelResult) => {
           void (async () => {
+            if (!result.cancelled && result.disabledChanges.size > 0) {
+              for (const [serverName, disabled] of result.disabledChanges) {
+                try {
+                  const override = writeProjectServerDisabledOverride(configPath, ctx.cwd, serverName, disabled);
+                  if (override.changed) {
+                    configChanged = true;
+                  }
+                } catch (error) {
+                  ctx.ui.notify(`Failed to ${disabled ? "disable" : "enable"} server "${serverName}": ${error instanceof Error ? error.message : String(error)}`, "error");
+                }
+              }
+            }
             if (!result.cancelled && result.changes.size > 0) {
               writeDirectToolsConfig(result.changes, provenanceMap, config);
               await onDirectToolsConfigChanged?.(result.changes);
@@ -660,7 +787,7 @@ export async function openMcpPanel(
             done(undefined);
             resolve();
           });
-        }, { noticeLines, keybindings });
+        }, { noticeLines, keybindings, theme });
       },
       {
         overlay: true,
@@ -711,13 +838,14 @@ export async function openMcpAuthPanel(
 
   await new Promise<void>((resolve) => {
     ctx.ui.custom(
-      (tui, _theme, keybindings, done) => {
+      (tui, theme, keybindings, done) => {
         return createMcpPanel(config, cache, provenanceMap, callbacks, tui, () => {
           done(undefined);
           resolve();
         }, {
           authOnly: true,
           keybindings,
+          theme,
           noticeLines: ["Select an OAuth MCP server and press Enter or ctrl+a to authenticate."],
         });
       },

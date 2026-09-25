@@ -1,30 +1,52 @@
 import type { AgentToolResult, ToolInfo } from "@earendil-works/pi-coding-agent";
-import { UrlElicitationRequiredError, type Client } from "@modelcontextprotocol/client";
+import { UrlElicitationRequiredError, type Client, type JsonSchemaType, type JsonSchemaValidator, type Progress, type RequestOptions } from "@modelcontextprotocol/client";
 import { createRequire } from "node:module";
 import type { McpExtensionState } from "./state.ts";
 import type { ToolMetadata, McpContent } from "./types.ts";
-import { getServerPrefix, isServerDisabled, parseUiPromptHandoff } from "./types.ts";
+import { getServerPrefix, getToolNameCandidates, isServerDisabled, parseUiPromptHandoff, resolveToolPrefix, type ServerEntry } from "./types.ts";
 import { lazyConnect, markKeepAliveAfterConnect, notifyToolMetadataUpdated, updateServerMetadata, updateMetadataCache, getFailureAgeSeconds, updateStatusBar, clearFailure, recordFailure } from "./init.ts";
 import { abortable, throwIfAborted } from "./abort.ts";
 import { combineAbortSignals, isAbortError } from "./runtime-owner.ts";
-import { buildToolMetadata, getToolNames, findToolByName, formatSchema } from "./tool-metadata.ts";
+import { buildToolMetadata, getToolNames, formatSchema } from "./tool-metadata.ts";
 import { renderTsShape } from "./ts-shape.ts";
 import { reconstructPromptMetadata } from "./metadata-cache.ts";
-import { resolveMcpResultContent, transformMcpContent, transformMcpResourceContents } from "./tool-registrar.ts";
+import { resolveMcpResultContent, transformMcpResourceContents } from "./tool-registrar.ts";
 import { guardMcpOutput, guardedMcpDetails, resolveMcpOutputGuardOptions } from "./mcp-output-guard.ts";
 import { maybeStartUiSession, summarizeUiSessionResult, type UiSessionRuntime } from "./ui-session.ts";
 import { formatAuthRequiredMessage, formatMcpStatus, normalizeToolArguments, resolveServerUrl, truncateAtWord } from "./utils.ts";
-import { authenticate, completeAuthFromInput, startAuth, supportsOAuth } from "./mcp-auth-flow.ts";
+import { authenticate, completeAuthFromInput, getAuthStatus, startAuth, supportsOAuth } from "./mcp-auth-flow.ts";
 import { SessionRecoveryAuthRequiredError, withSessionRecovery } from "./session-recovery.ts";
+import { callToolViaTaskSession } from "./mcp-tasks.ts";
 import { paginate, rankSuggestions, rankToolMatches, resolveSearchKeywords } from "./search-ranking.ts";
 import { ensureToolCallApproved, isToolCallApprovalRequired } from "./tool-approval.ts";
+import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
+import { semanticSearch, type SemanticSearchBackend, type SemanticSearchEvaluator } from "./semantic-search.ts";
+import { getInputRequiredNeedsUiDetails } from "./errors.ts";
+import { createJsonSchemaValidator } from "./json-schema-validator.ts";
 
 type ProxyToolResult = AgentToolResult<Record<string, unknown>>;
 type ClientCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
 type ClientReadResourceResult = Awaited<ReturnType<Client["readResource"]>>;
 
 const require = createRequire(import.meta.url);
+const proxyArgumentValidators = new WeakMap<object, JsonSchemaValidator<unknown>>();
 const MAX_REGEX_SEARCH_QUERY_LENGTH = 256;
+
+function proxyArgumentValidationError(inputSchema: unknown, args: unknown): string | null {
+  if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) return null;
+  try {
+    let validate = proxyArgumentValidators.get(inputSchema);
+    if (!validate) {
+      validate = createJsonSchemaValidator().getValidator(inputSchema as JsonSchemaType);
+      proxyArgumentValidators.set(inputSchema, validate);
+    }
+    const result = validate(args);
+    return result.valid ? null : result.errorMessage ?? "arguments do not match the advertised input schema";
+  } catch {
+    // Preserve server-side validation for schema dialects the adapter cannot evaluate.
+    return null;
+  }
+}
 const INSTRUCTIONS_PREVIEW_LENGTH = 300;
 const REGEX_SAFETY_CHECK_PARAMS = {
   attackTimeout: 50,
@@ -32,10 +54,36 @@ const REGEX_SAFETY_CHECK_PARAMS = {
   timeout: 250,
 } as const;
 
+const backgroundAuthWatchers = new WeakMap<McpExtensionState, Map<string, Promise<void>>>();
+
 type AutoAuthResult =
   | { status: "skipped" }
   | { status: "success" }
   | { status: "failed"; message: string };
+
+let nextProgressInvocationId = 1;
+
+/**
+ * Bridges SDK request-local progress callbacks to the interactive UI notify
+ * path (#437 item 3). The SDK owns `_meta.progressToken` injection when
+ * `onprogress` is set; this never writes the token manually.
+ */
+function withUiProgressBridge(
+  options: RequestOptions | undefined,
+  ui: McpExtensionState["ui"],
+  serverName: string,
+  toolName: string,
+): RequestOptions | undefined {
+  if (!ui) return options;
+  const label = `MCP ${serverName}/${toolName}#${nextProgressInvocationId++}`;
+  return {
+    ...options,
+    onprogress: (progress: Progress) => {
+      const ratio = `${progress.progress}${progress.total === undefined ? "" : `/${progress.total}`}`;
+      ui.notify(progress.message ? `${label}: ${progress.message} (${ratio})` : `${label}: ${ratio}`, "info");
+    },
+  };
+}
 
 function getToolMatches(metadata: ToolMetadata[] | undefined, toolName: string, exact: boolean): ToolMetadata[] {
   if (!metadata) return [];
@@ -53,10 +101,92 @@ function getEnabledToolMatches(state: McpExtensionState, toolName: string, exact
   return matches;
 }
 
-function getSingleToolMatch(metadata: ToolMetadata[] | undefined, toolName: string): ToolMetadata | "ambiguous" | undefined {
-  const exactMatches = getToolMatches(metadata, toolName, true);
-  const matches = exactMatches.length > 0 ? exactMatches : getToolMatches(metadata, toolName, false);
-  return matches.length > 1 ? "ambiguous" : matches[0];
+function getEnabledOriginalToolMatches(state: McpExtensionState, toolName: string): { server: string; tool: ToolMetadata }[] {
+  const matches: { server: string; tool: ToolMetadata }[] = [];
+  for (const [server, metadata] of state.toolMetadata) {
+    if (isServerDisabled(state.config.mcpServers[server])) continue;
+    for (const tool of metadata) {
+      if (tool.originalName === toolName) matches.push({ server, tool });
+    }
+  }
+  return matches;
+}
+
+function serverBackoffResult(state: McpExtensionState, mode: string, serverName: string): ProxyToolResult {
+  const failedAgo = getFailureAgeSeconds(state, serverName) ?? 0;
+  const message = `Server "${serverName}" not available (last failed ${failedAgo}s ago)`;
+  return {
+    content: [{ type: "text" as const, text: message }],
+    details: { mode, error: "server_backoff", server: serverName },
+  };
+}
+
+function getCandidateToolMatches(
+  metadata: ToolMetadata[] | undefined,
+  toolName: string,
+  serverName: string,
+  state: McpExtensionState,
+): ToolMetadata[] {
+  if (!metadata) return [];
+  const prefix = resolveToolPrefix(state.config.mcpServers[serverName], state.config.settings?.toolPrefix);
+  return metadata.filter((tool) => getToolNameCandidates(tool.originalName, serverName, prefix).has(toolName));
+}
+
+function getCandidateToolMatch(
+  metadata: ToolMetadata[] | undefined,
+  toolName: string,
+  serverName: string,
+  state: McpExtensionState,
+): ToolMetadata | "ambiguous" | undefined {
+  const exact = metadata?.filter((tool) => tool.name === toolName) ?? [];
+  if (exact.length > 0) return exact.length === 1 ? exact[0] : "ambiguous";
+  const candidates = getCandidateToolMatches(metadata, toolName, serverName, state);
+  return candidates.length > 1 ? "ambiguous" : candidates[0];
+}
+
+function getPrefixedServerScope(state: McpExtensionState, toolName: string): string | undefined {
+  const candidates = Object.entries(state.config.mcpServers)
+    .filter(([, definition]) => !isServerDisabled(definition))
+    .map(([name, definition]) => ({
+      name,
+      prefix: getServerPrefix(name, resolveToolPrefix(definition, state.config.settings?.toolPrefix)),
+    }))
+    .filter(({ prefix }) => prefix.length > 0 && toolName.startsWith(`${prefix}_`))
+    .sort((a, b) => b.prefix.length - a.prefix.length);
+  if (candidates.length === 0) return undefined;
+  const longest = candidates[0]!.prefix.length;
+  const best = candidates.filter(({ prefix }) => prefix.length === longest);
+  return best.length === 1 ? best[0]!.name : undefined;
+}
+
+type ServerScopedToolMatch = { tool: ToolMetadata; precedence: number } | "ambiguous";
+
+function getServerScopedToolCandidates(
+  metadata: ToolMetadata[] | undefined,
+  toolName: string,
+): { tools: ToolMetadata[]; precedence: number } | undefined {
+  if (!metadata) return undefined;
+  const normalizedName = toolName.replace(/-/g, "_");
+  const exactDisplayedMatches = metadata.filter((tool) => tool.name === toolName);
+  if (exactDisplayedMatches.length > 0) return { tools: exactDisplayedMatches, precedence: 0 };
+  const exactOriginalMatches = metadata.filter((tool) => tool.originalName === toolName);
+  if (exactOriginalMatches.length > 0) return { tools: exactOriginalMatches, precedence: 1 };
+  const normalizedDisplayedMatches = metadata.filter((tool) => tool.name.replace(/-/g, "_") === normalizedName);
+  const normalizedOriginalMatches = metadata.filter((tool) => tool.originalName.replace(/-/g, "_") === normalizedName);
+  const normalizedMatches = new Set([...normalizedDisplayedMatches, ...normalizedOriginalMatches]);
+  if (normalizedMatches.size === 0) return undefined;
+  return {
+    tools: [...normalizedMatches],
+    precedence: normalizedDisplayedMatches.length > 0 ? 2 : 3,
+  };
+}
+
+function getServerScopedToolMatch(metadata: ToolMetadata[] | undefined, toolName: string): ServerScopedToolMatch | undefined {
+  const candidates = getServerScopedToolCandidates(metadata, toolName);
+  if (!candidates) return undefined;
+  return candidates.tools.length === 1
+    ? { tool: candidates.tools[0]!, precedence: candidates.precedence }
+    : "ambiguous";
 }
 
 function ambiguousToolResult(mode: "call" | "describe", toolName: string): ProxyToolResult {
@@ -67,12 +197,94 @@ function ambiguousToolResult(mode: "call" | "describe", toolName: string): Proxy
   };
 }
 
+function ambiguousServerToolResult(
+  mode: "call" | "describe",
+  toolName: string,
+  serverName: string,
+): ProxyToolResult {
+  const message = `Tool "${toolName}" matches multiple tools on server "${serverName}". Use an exact displayed or upstream tool name; run mcp({ server: "${serverName}" }) to list available tools.`;
+  return {
+    content: [{ type: "text" as const, text: message }],
+    details: { mode, error: "ambiguous_tool", server: serverName, requestedTool: toolName, message },
+  };
+}
+
 function disabledResult(mode: string, serverName: string): ProxyToolResult {
   const message = `Server "${serverName}" is disabled. Run /mcp enable ${serverName} and /reload to enable it.`;
   return {
     content: [{ type: "text" as const, text: message }],
     details: { mode, error: "server_disabled", server: serverName, message },
   };
+}
+
+function emitAuthStatus(state: McpExtensionState, serverName: string, status: "authenticated" | "failed", message: string): void {
+  state.ui?.notify(message, status === "authenticated" ? "info" : "error");
+  state.sendMessage?.(
+    {
+      customType: "mcp-oauth-status",
+      content: [{ type: "text", text: message }],
+      display: message,
+      details: {
+        server: serverName,
+        status,
+        ...(status === "authenticated" ? { nextAction: { connect: serverName } } : {}),
+      },
+    },
+    { triggerTurn: true },
+  );
+}
+
+function ensureBackgroundAuthWatcher(
+  state: McpExtensionState,
+  serverName: string,
+  serverUrl: string,
+  definition: ServerEntry,
+): void {
+  let watchers = backgroundAuthWatchers.get(state);
+  if (!watchers) {
+    watchers = new Map();
+    backgroundAuthWatchers.set(state, watchers);
+  }
+  if (watchers.has(serverName)) return;
+
+  const authOptions = {
+    authStorageOptions: state.authStorageOptions,
+    runtime: state.oauthRuntime,
+    openAuthorizationUrl: state.openBrowser,
+  };
+  const watcher = authenticate(serverName, serverUrl, definition, authOptions).then(async (status) => {
+    throwIfAborted(state.owner.signal);
+    if (status !== "authenticated") throw new Error(`OAuth authentication ended with status: ${status}`);
+    await state.manager.close(serverName);
+    throwIfAborted(state.owner.signal);
+    clearFailure(state, serverName, "auth-background-complete");
+    updateStatusBar(state);
+    emitAuthStatus(
+      state,
+      serverName,
+      "authenticated",
+      `OAuth authentication completed for MCP server "${serverName}". Connect it now to load and verify its tools.`,
+    );
+  });
+  watchers.set(serverName, watcher);
+
+  void watcher.catch(async (error) => {
+    if (isAbortError(error, state.owner.signal)) return;
+    try {
+      if (await getAuthStatus(serverName, authOptions) === "authenticated") return;
+    } catch (statusError) {
+      if (isAbortError(statusError, state.owner.signal)) return;
+    }
+    if (state.owner.signal.aborted) return;
+    emitAuthStatus(
+      state,
+      serverName,
+      "failed",
+      `OAuth authentication failed for MCP server "${serverName}". Start authorization again or inspect trusted logs.`,
+    );
+  }).finally(() => {
+    if (watchers?.get(serverName) === watcher) watchers.delete(serverName);
+  });
 }
 
 function getAuthRequiredMessage(
@@ -91,35 +303,47 @@ function getAuthFailedMessage(state: McpExtensionState, serverName: string, mess
   return `OAuth authentication failed for "${serverName}": ${message}. Run mcp({ action: "auth-start", server: "${serverName}" }) to get a browser URL, or /mcp-auth ${serverName} in an interactive local session.`;
 }
 
-function getRedirectPort(authorizationUrl: string): number | undefined {
+function getRedirectDetails(authorizationUrl: string): { port?: number; remote: boolean } {
   try {
     const redirectUri = new URL(authorizationUrl).searchParams.get("redirect_uri");
-    if (!redirectUri) return undefined;
-    const port = Number.parseInt(new URL(redirectUri).port, 10);
-    return Number.isInteger(port) ? port : undefined;
+    if (!redirectUri) return { remote: false };
+    const redirect = new URL(redirectUri);
+    const hostname = redirect.hostname.toLowerCase();
+    const local = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+    const port = Number.parseInt(redirect.port, 10);
+    return {
+      ...(Number.isInteger(port) ? { port } : {}),
+      remote: !local,
+    };
   } catch {
-    return undefined;
+    return { remote: false };
   }
 }
 
 function formatManualAuthInstructions(serverName: string, authorizationUrl: string): string {
-  const port = getRedirectPort(authorizationUrl);
-  const portNote = port
-    ? `\nThe redirect URL will use local port ${port}. On a remote server it is expected for that localhost page to fail locally; copy the address bar URL anyway.`
-    : "";
+  const redirect = getRedirectDetails(authorizationUrl);
+  const redirectNote = redirect.remote
+    ? "The provider uses a pre-registered HTTPS callback. Copy its full URL from the browser address bar, even if the destination page reports an error."
+    : `The adapter is watching${redirect.port ? ` local port ${redirect.port}` : " the local callback"} and will report when authentication completes.`;
 
   return [
     `MCP OAuth required for "${serverName}".`,
     "",
-    "Open this URL in your local browser:",
+    redirect.remote
+      ? "The adapter is attempting to open this authorization URL in your local browser:"
+      : "The adapter is attempting to open this authorization URL and watching for its callback:",
     "",
     authorizationUrl,
     "",
-    "After approving, copy the full redirected localhost URL from your browser address bar and send it back with:",
+    redirect.remote
+      ? "After approving, copy the full callback URL from your browser address bar and send it back with:"
+      : "If the browser does not open or the callback is not detected, open the URL above and complete manually with:",
     `mcp({ action: "auth-complete", server: "${serverName}", args: { redirectUrl: "PASTE_REDIRECT_URL_HERE" } })`,
     "",
-    'You can also pass just the `code` query parameter as `args: { code: "PASTE_CODE_HERE" }`. JSON-string args remain supported.',
-    portNote.trimEnd(),
+    redirect.remote
+      ? "Remote HTTPS callbacks must include the full callback URL so the OAuth state can be checked. JSON-string args remain supported."
+      : 'You can also pass just the `code` query parameter as `args: { code: "PASTE_CODE_HERE" }`. JSON-string args remain supported.',
+    redirectNote,
   ].filter(Boolean).join("\n");
 }
 
@@ -277,14 +501,13 @@ export function executeUiMessages(state: McpExtensionState): ProxyToolResult {
 }
 
 export function executeStatus(state: McpExtensionState): ProxyToolResult {
-  const servers: Array<{ name: string; status: string; toolCount: number; failedAgo: number | null; disabled?: boolean }> = [];
+  const servers: Array<{ name: string; status: string; listenState: string; catalogStale?: boolean; toolCount: number; failedAgo: number | null; disabled?: boolean }> = [];
 
   for (const name of Object.keys(state.config.mcpServers)) {
     const definition = state.config.mcpServers[name];
     const disabled = isServerDisabled(definition);
     const connection = disabled ? undefined : state.manager.getConnection(name);
     const metadata = disabled ? undefined : state.toolMetadata.get(name);
-    const toolCount = metadata?.length ?? 0;
     const failedAgo = disabled ? null : getFailureAgeSeconds(state, name);
     let status = disabled ? "disabled" : "not connected";
     if (!disabled && connection?.status === "connected") {
@@ -297,7 +520,18 @@ export function executeStatus(state: McpExtensionState): ProxyToolResult {
       status = "cached";
     }
 
-    servers.push({ name, status, toolCount, failedAgo, ...(disabled ? { disabled: true } : {}) });
+    const toolCount = status === "failed" ? 0 : metadata?.length ?? 0;
+
+    const listenState = connection?.status === "connected" ? connection.listenState : "disconnected";
+    servers.push({
+      name,
+      status,
+      listenState,
+      ...(connection?.status === "connected" && connection.listenCatalogStale ? { catalogStale: true } : {}),
+      toolCount,
+      failedAgo,
+      ...(disabled ? { disabled: true } : {}),
+    });
   }
 
   const disabledCount = servers.filter(s => s.disabled).length;
@@ -314,7 +548,18 @@ export function executeStatus(state: McpExtensionState): ProxyToolResult {
       continue;
     }
     if (server.status === "connected") {
-      text += `✓ ${server.name} (${server.toolCount} tools)\n`;
+      const listen = server.listenState === "active"
+        ? server.catalogStale
+          ? ", listen active, catalog may be stale"
+          : ", listen active"
+        : server.listenState === "dropped"
+          ? ", catalog may be stale; will reconcile on next keep-alive or tool use"
+          : server.listenState === "re-establishing"
+            ? ", re-establishing listen"
+            : server.listenState === "legacy"
+              ? ", legacy notification path"
+              : ", not listening for catalog updates";
+      text += `✓ ${server.name} (${server.toolCount} tools${listen})\n`;
       continue;
     }
     if (server.status === "needs-auth") {
@@ -322,14 +567,19 @@ export function executeStatus(state: McpExtensionState): ProxyToolResult {
       continue;
     }
     if (server.status === "cached") {
-      text += `○ ${server.name} (${server.toolCount} tools, cached)\n`;
+      text += `○ ${server.name} (${server.toolCount} tools, cached; not listening)\n`;
       continue;
     }
     if (server.status === "failed") {
       text += `✗ ${server.name} (failed ${server.failedAgo ?? 0}s ago)\n`;
       continue;
     }
-    text += `○ ${server.name} (not connected)\n`;
+    text += `○ ${server.name} (not listening; disconnected)\n`;
+  }
+
+  const directToolsFrozen = state.config.settings?.freezeDirectTools === true;
+  if (directToolsFrozen) {
+    text += "\nDirect tools frozen; active registrations may differ from current metadata.\n";
   }
 
   if (servers.length > 0) {
@@ -338,7 +588,7 @@ export function executeStatus(state: McpExtensionState): ProxyToolResult {
 
   return {
     content: [{ type: "text" as const, text: text.trim() }],
-    details: { mode: "status", servers, totalTools, connectedCount, disabledCount },
+    details: { mode: "status", servers, totalTools, connectedCount, disabledCount, directToolsFrozen },
   };
 }
 
@@ -375,6 +625,16 @@ export async function executeAuthStart(state: McpExtensionState, serverName: str
         content: [{ type: "text" as const, text: `OAuth authentication successful for "${serverName}".` }],
         details: { mode: "auth-start", server: serverName, authenticated: true },
       };
+    }
+
+    if (getRedirectDetails(authorizationUrl).remote) {
+      try {
+        await state.openBrowser(authorizationUrl);
+      } catch (error) {
+        if (isAbortError(error, ownedSignal)) throw error;
+      }
+    } else {
+      ensureBackgroundAuthWatcher(state, serverName, serverUrl, definition);
     }
 
     return {
@@ -418,7 +678,7 @@ export async function executeAuthComplete(state: McpExtensionState, serverName: 
     }
 
     await state.manager.close(serverName);
-    clearFailure(state, serverName);
+    clearFailure(state, serverName, "auth-complete");
     updateStatusBar(state);
     return {
       content: [{ type: "text" as const, text: `OAuth authentication successful for "${serverName}". Run mcp({ connect: "${serverName}" }) to connect with the new token.` }],
@@ -433,38 +693,61 @@ export async function executeAuthComplete(state: McpExtensionState, serverName: 
   }
 }
 
-export function executeDescribe(state: McpExtensionState, toolName: string): ProxyToolResult {
-  const exactMatches = getEnabledToolMatches(state, toolName, true);
-  if (exactMatches.length > 1) return ambiguousToolResult("describe", toolName);
-  if (exactMatches.length === 0 && getEnabledToolMatches(state, toolName, false).length > 1) {
-    return ambiguousToolResult("describe", toolName);
-  }
-
-  let serverName = exactMatches[0]?.server;
-  let toolMeta = exactMatches[0]?.tool;
+export function executeDescribe(state: McpExtensionState, toolName: string, serverOverride?: string): ProxyToolResult {
+  let serverName: string | undefined;
+  let toolMeta: ToolMetadata | undefined;
   let disabledMatch: string | undefined;
+  let failedMatch: string | undefined;
 
-  if (!toolMeta) {
+  if (serverOverride) {
+    if (!state.config.mcpServers[serverOverride]) {
+      return {
+        content: [{ type: "text" as const, text: `Server "${serverOverride}" not found. Use mcp({}) to see available servers.` }],
+        details: { mode: "describe", error: "server_not_found", server: serverOverride, requestedTool: toolName },
+      };
+    }
+    const match = getServerScopedToolMatch(state.toolMetadata.get(serverOverride), toolName);
+    if (match === "ambiguous") return ambiguousServerToolResult("describe", toolName, serverOverride);
+    if (isServerDisabled(state.config.mcpServers[serverOverride])) return disabledResult("describe", serverOverride);
+    if (isServerInActiveFailureBackoff(state, serverOverride)) return serverBackoffResult(state, "describe", serverOverride);
+    serverName = serverOverride;
+    toolMeta = match?.tool;
+  } else {
+    const matches: Array<{ server: string; tool: ToolMetadata; precedence: number }> = [];
     for (const [server, metadata] of state.toolMetadata.entries()) {
-      const found = findToolByName(metadata, toolName);
-      if (!found) continue;
+      const candidates = getServerScopedToolCandidates(metadata, toolName);
+      if (!candidates) continue;
       if (isServerDisabled(state.config.mcpServers[server])) {
         disabledMatch ??= server;
         continue;
       }
-      serverName = server;
-      toolMeta = found;
-      break;
+      if (isServerInActiveFailureBackoff(state, server)) {
+        failedMatch ??= server;
+        continue;
+      }
+      for (const tool of candidates.tools) matches.push({ server, tool, precedence: candidates.precedence });
+    }
+    if (matches.length > 0) {
+      const precedence = Math.min(...matches.map(match => match.precedence));
+      const bestMatches = matches.filter(match => match.precedence === precedence);
+      if (bestMatches.length > 1) return ambiguousToolResult("describe", toolName);
+      serverName = bestMatches[0]!.server;
+      toolMeta = bestMatches[0]!.tool;
     }
   }
 
   if (!serverName || !toolMeta) {
     if (disabledMatch) return disabledResult("describe", disabledMatch);
-    const suggestions = rankSuggestions(state, toolName, 5);
+    if (failedMatch) return serverBackoffResult(state, "describe", failedMatch);
+    const suggestions = rankSuggestions(state, toolName, 5, serverOverride);
     const suggestionText = suggestions.length > 0 ? ` Did you mean: ${suggestions.join(", ")}` : "";
+    const scopeText = serverOverride ? ` on server "${serverOverride}"` : "";
+    const searchHint = serverOverride
+      ? `mcp({ search: "...", server: "${serverOverride}" })`
+      : `mcp({ search: "..." })`;
     return {
-      content: [{ type: "text" as const, text: `Tool "${toolName}" not found. Use mcp({ search: "..." }) to search.${suggestionText}` }],
-      details: { mode: "describe", error: "tool_not_found", requestedTool: toolName, suggestions },
+      content: [{ type: "text" as const, text: `Tool "${toolName}" not found${scopeText}. Use ${searchHint} to search.${suggestionText}` }],
+      details: { mode: "describe", error: "tool_not_found", server: serverOverride, requestedTool: toolName, suggestions },
     };
   }
 
@@ -493,6 +776,78 @@ export function executeDescribe(state: McpExtensionState, toolName: string): Pro
   };
 }
 
+function renderSearchResults(
+  state: McpExtensionState,
+  query: string,
+  server: string | undefined,
+  showSchemas: boolean,
+  limit: number,
+  offset: number,
+  matches: Array<{ server: string; tool: ToolMetadata; score: number }>,
+  backend?: SemanticSearchBackend,
+): ProxyToolResult {
+  const page = paginate(matches, offset, limit);
+  if (page.total === 0) {
+    const connectingServers = server
+      ? state.config.mcpServers[server] && state.manager.isConnecting(server) ? [server] : []
+      : Object.keys(state.config.mcpServers)
+        .filter(name => !isServerDisabled(state.config.mcpServers[name]) && state.manager.isConnecting(name))
+        .sort((a, b) => a.localeCompare(b));
+    const scope = server ? ` in "${server}"` : "";
+    const msg = backend?.requested === "semantic" && backend.used === "semantic" && backend.abstained
+      ? `Jev found no suitable tool for "${query}"${scope}`
+      : `No tools matching "${query}"${scope}`;
+    const connectingMessage = connectingServers.length === 1
+      ? ` Server "${connectingServers[0]}" is still connecting; retry in a moment.`
+      : connectingServers.length > 1
+        ? ` Servers ${connectingServers.map(name => `"${name}"`).join(", ")} are still connecting; retry in a moment.`
+        : "";
+    return {
+      content: [{ type: "text" as const, text: `${msg}${connectingMessage}` }],
+      details: {
+        mode: "search", matches: [], count: 0, hasMore: false, nextOffset: null, query,
+        ...(backend ? { backend } : {}),
+        ...(connectingServers.length > 0 ? { connectingServers } : {}),
+      },
+    };
+  }
+
+  let text = `Found ${page.total} tool${page.total === 1 ? "" : "s"} matching "${query}":\n\n`;
+  for (const match of page.items) {
+    const approvalMarker = isToolCallApprovalRequired(state.config, match.server, match.tool, state.toolMetadata)
+      ? " (requires approval)"
+      : "";
+    if (showSchemas) {
+      text += `${match.tool.name}${approvalMarker}\n`;
+      text += `  ${match.tool.description || "(no description)"}\n`;
+      if (match.tool.inputSchema && !match.tool.resourceUri) {
+        const shape = renderTsShape(match.tool.inputSchema);
+        text += shape === null
+          ? `\n  Parameters:\n${formatSchema(match.tool.inputSchema, "    ")}\n`
+          : `\n  Shape:\n${shape.split("\n").map(line => `    ${line}`).join("\n")}\n`;
+      } else if (match.tool.resourceUri) {
+        text += "  No parameters (resource tool).\n";
+      }
+      text += "\n";
+    } else {
+      text += `- ${match.tool.name}${approvalMarker}`;
+      if (match.tool.description) text += ` - ${truncateAtWord(match.tool.description, 50)}`;
+      text += "\n";
+    }
+  }
+  if (page.hasMore) text += `\n${page.items.length} of ${page.total} — offset: ${page.nextOffset} for more\n`;
+
+  return {
+    content: [{ type: "text" as const, text: text.trim() }],
+    details: {
+      mode: "search",
+      matches: page.items.map(match => ({ server: match.server, tool: match.tool.name, score: match.score })),
+      count: page.total, hasMore: page.hasMore, nextOffset: page.nextOffset, query,
+      ...(backend ? { backend } : {}),
+    },
+  };
+}
+
 export function executeSearch(
   state: McpExtensionState,
   query: string,
@@ -501,9 +856,36 @@ export function executeSearch(
   includeSchemas?: boolean,
   limit = 12,
   offset = 0,
-): ProxyToolResult {
+  searchMode: "lexical" | "semantic" = "lexical",
+  signal?: AbortSignal,
+  semanticEvaluator?: SemanticSearchEvaluator,
+): ProxyToolResult | Promise<ProxyToolResult> {
   const showSchemas = includeSchemas !== false;
+  if ((searchMode as string) !== "lexical" && (searchMode as string) !== "semantic") {
+    return {
+      content: [{ type: "text" as const, text: "Search mode must be lexical or semantic." }],
+      details: { mode: "search", error: "invalid_search_mode", query },
+    };
+  }
   if (server && isServerDisabled(state.config.mcpServers[server])) return disabledResult("search", server);
+  if (server && isServerInActiveFailureBackoff(state, server)) return serverBackoffResult(state, "search", server);
+  if (searchMode === "semantic" && regex) {
+    return {
+      content: [{ type: "text" as const, text: "Semantic search cannot be combined with regex search." }],
+      details: { mode: "search", error: "invalid_search_mode", query },
+    };
+  }
+  if (searchMode === "semantic") {
+    return semanticSearch(state, query, server, signal, semanticEvaluator).then(result => {
+      if (!result.ok) {
+        return {
+          content: [{ type: "text" as const, text: `Semantic search failed: ${result.error.message}` }],
+          details: { mode: "search", error: result.error.code, message: result.error.message, query },
+        };
+      }
+      return renderSearchResults(state, query, server, showSchemas, limit, offset, result.matches, result.backend);
+    });
+  }
 
   let matches: Array<{ server: string; tool: ToolMetadata; score: number }>;
   if (regex) {
@@ -545,6 +927,7 @@ export function executeSearch(
     for (const [serverName, metadata] of state.toolMetadata.entries()) {
       const definition = state.config.mcpServers[serverName];
       if (isServerDisabled(definition)) continue;
+      if (isServerInActiveFailureBackoff(state, serverName)) continue;
       if (server && serverName !== server) continue;
       for (const tool of metadata) {
         const matched = pattern.test(tool.name) || pattern.test(tool.description)
@@ -566,69 +949,7 @@ export function executeSearch(
     matches = rankToolMatches(state, query, server);
   }
 
-  const page = paginate(matches, offset, limit);
-  if (page.total === 0) {
-    const connectingServers = server
-      ? state.config.mcpServers[server] && state.manager.isConnecting(server) ? [server] : []
-      : Object.keys(state.config.mcpServers)
-        .filter(name => !isServerDisabled(state.config.mcpServers[name]) && state.manager.isConnecting(name))
-        .sort((a, b) => a.localeCompare(b));
-    const msg = server ? `No tools matching "${query}" in "${server}"` : `No tools matching "${query}"`;
-    const connectingMessage = connectingServers.length === 1
-      ? ` Server "${connectingServers[0]}" is still connecting; retry in a moment.`
-      : connectingServers.length > 1
-        ? ` Servers ${connectingServers.map(name => `"${name}"`).join(", ")} are still connecting; retry in a moment.`
-        : "";
-    return {
-      content: [{ type: "text" as const, text: `${msg}${connectingMessage}` }],
-      details: {
-        mode: "search",
-        matches: [],
-        count: 0,
-        hasMore: false,
-        nextOffset: null,
-        query,
-        ...(connectingServers.length > 0 ? { connectingServers } : {}),
-      },
-    };
-  }
-
-  let text = `Found ${page.total} tool${page.total === 1 ? "" : "s"} matching "${query}":\n\n`;
-  for (const match of page.items) {
-    const approvalMarker = isToolCallApprovalRequired(state.config, match.server, match.tool, state.toolMetadata)
-      ? " (requires approval)"
-      : "";
-    if (showSchemas) {
-      text += `${match.tool.name}${approvalMarker}\n`;
-      text += `  ${match.tool.description || "(no description)"}\n`;
-      if (match.tool.inputSchema && !match.tool.resourceUri) {
-        const shape = renderTsShape(match.tool.inputSchema);
-        text += shape === null
-          ? `\n  Parameters:\n${formatSchema(match.tool.inputSchema, "    ")}\n`
-          : `\n  Shape:\n${shape.split("\n").map(line => `    ${line}`).join("\n")}\n`;
-      } else if (match.tool.resourceUri) {
-        text += "  No parameters (resource tool).\n";
-      }
-      text += "\n";
-    } else {
-      text += `- ${match.tool.name}${approvalMarker}`;
-      if (match.tool.description) text += ` - ${truncateAtWord(match.tool.description, 50)}`;
-      text += "\n";
-    }
-  }
-  if (page.hasMore) text += `\n${page.items.length} of ${page.total} — offset: ${page.nextOffset} for more\n`;
-
-  return {
-    content: [{ type: "text" as const, text: text.trim() }],
-    details: {
-      mode: "search",
-      matches: page.items.map(match => ({ server: match.server, tool: match.tool.name, score: match.score })),
-      count: page.total,
-      hasMore: page.hasMore,
-      nextOffset: page.nextOffset,
-      query,
-    },
-  };
+  return renderSearchResults(state, query, server, showSchemas, limit, offset, matches);
 }
 
 export function executeList(state: McpExtensionState, server: string): ProxyToolResult {
@@ -644,6 +965,12 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
   const metadata = state.toolMetadata.get(server);
   const toolNames = metadata?.map(m => m.name) ?? [];
   const connection = state.manager.getConnection(server);
+  if (isServerInActiveFailureBackoff(state, server)) {
+    return {
+      ...serverBackoffResult(state, "list", server),
+      details: { mode: "list", server, tools: [], count: 0, error: "server_backoff" },
+    };
+  }
   const instructions = state.serverInstructions.get(server);
   let instructionsText = "";
   if (instructions) {
@@ -673,7 +1000,17 @@ export function executeList(state: McpExtensionState, server: string): ProxyTool
     };
   }
 
-  const cachedNote = connection?.status === "connected" ? "" : " (not connected, cached)";
+  // "not connected" alone reads as an outage while the tools listed below are
+  // real and the connection is simply lazy (tools served from cache).
+  // Distinguish auth from plain laziness so the caller knows which remedy applies.
+  let cachedNote = "";
+  if (connection?.status !== "connected") {
+    if (connection?.status === "needs-auth") {
+      cachedNote = ` (needs auth — run mcp({ action: "auth-start", server: "${server}" }))`;
+    } else {
+      cachedNote = ` (lazy: tools from cache, not connected yet — mcp({ connect: "${server}" }) to connect)`;
+    }
+  }
   let text = `${server} (${toolNames.length} tools${cachedNote}):\n\n`;
 
   const descMap = new Map<string, string>();
@@ -708,6 +1045,7 @@ export function executeInstructions(state: McpExtensionState, server: string): P
     };
   }
   if (isServerDisabled(definition)) return disabledResult("instructions", server);
+  if (isServerInActiveFailureBackoff(state, server)) return serverBackoffResult(state, "instructions", server);
 
   const instructions = state.serverInstructions.get(server);
   if (instructions) {
@@ -787,9 +1125,9 @@ export async function executeConnect(state: McpExtensionState, serverName: strin
       state.serverInstructions.delete(serverName);
     }
     updateMetadataCache(state, serverName);
-    notifyToolMetadataUpdated(state, serverName, "proxy-connect");
+    const restored = clearFailure(state, serverName, "proxy-connect");
+    if (!restored) notifyToolMetadataUpdated(state, serverName, "proxy-connect");
     markKeepAliveAfterConnect(state, serverName);
-    clearFailure(state, serverName);
     updateStatusBar(state);
     return executeList(state, serverName);
   } catch (error) {
@@ -811,6 +1149,8 @@ export async function executeCall(
   getPiTools?: () => ToolInfo[],
   signal?: AbortSignal,
   origin?: "proxy" | "script",
+  // Internal consumers own successful data delivery; origin remains approval metadata only.
+  internalDelivery?: { onSuccess: (data: unknown) => void },
 ): Promise<ProxyToolResult> {
   const ownedSignal = combineAbortSignals(state.owner?.signal, signal);
   throwIfAborted(ownedSignal);
@@ -843,8 +1183,8 @@ export async function executeCall(
     };
   }
   if (serverName) {
-    const match = getSingleToolMatch(state.toolMetadata.get(serverName), toolName);
-    if (match === "ambiguous") return ambiguousToolResult("call", toolName);
+    const match = getCandidateToolMatch(state.toolMetadata.get(serverName), toolName, serverName, state);
+    if (match === "ambiguous") return ambiguousServerToolResult("call", toolName, serverName);
     toolMeta = match;
     if (isServerDisabled(state.config.mcpServers[serverName])) {
       return disabledCallResult(serverName, toolMeta);
@@ -852,43 +1192,52 @@ export async function executeCall(
   } else {
     const exactMatches = getEnabledToolMatches(state, toolName, true);
     if (exactMatches.length > 1) return ambiguousToolResult("call", toolName);
-    if (exactMatches.length === 0 && getEnabledToolMatches(state, toolName, false).length > 1) {
-      return ambiguousToolResult("call", toolName);
+    if (exactMatches.length === 1) {
+      serverName = exactMatches[0]!.server;
+      toolMeta = exactMatches[0]!.tool;
+    } else {
+      const originalMatches = getEnabledOriginalToolMatches(state, toolName);
+      if (originalMatches.length > 1) return ambiguousToolResult("call", toolName);
+      if (originalMatches.length === 1) {
+        serverName = originalMatches[0]!.server;
+        toolMeta = originalMatches[0]!.tool;
+      } else {
+        const prefixedScope = getPrefixedServerScope(state, toolName);
+        if (prefixedScope) {
+          serverName = prefixedScope;
+          const match = getCandidateToolMatch(state.toolMetadata.get(prefixedScope), toolName, prefixedScope, state);
+          if (match === "ambiguous") return ambiguousServerToolResult("call", toolName, prefixedScope);
+          toolMeta = match;
+        } else {
+          const matches: Array<{ server: string; tool: ToolMetadata }> = [];
+          for (const [server, metadata] of state.toolMetadata) {
+            if (isServerDisabled(state.config.mcpServers[server])) continue;
+            for (const tool of getCandidateToolMatches(metadata, toolName, server, state)) matches.push({ server, tool });
+          }
+          if (matches.length > 1) return ambiguousToolResult("call", toolName);
+          if (matches.length === 1) {
+            serverName = matches[0]!.server;
+            toolMeta = matches[0]!.tool;
+          }
+        }
+      }
     }
 
-    let disabledMatch: { serverName: string; toolMeta: ToolMetadata } | undefined;
-    for (const [server, metadata] of state.toolMetadata.entries()) {
-      const found = metadata.find(tool => tool.name === toolName);
-      if (!found) continue;
-      if (isServerDisabled(state.config.mcpServers[server])) {
-        disabledMatch ??= { serverName: server, toolMeta: found };
-        continue;
+    if (!toolMeta) {
+      const disabledMatches: Array<{ server: string; tool: ToolMetadata }> = [];
+      for (const [server, metadata] of state.toolMetadata) {
+        if (!isServerDisabled(state.config.mcpServers[server])) continue;
+        for (const tool of getCandidateToolMatches(metadata, toolName, server, state)) disabledMatches.push({ server, tool });
       }
-      serverName = server;
-      toolMeta = found;
-      break;
+      if (disabledMatches.length === 1) return disabledCallResult(disabledMatches[0]!.server, disabledMatches[0]!.tool);
     }
-    if (!toolMeta && !disabledMatch) {
-      for (const [server, metadata] of state.toolMetadata.entries()) {
-        const found = findToolByName(metadata, toolName);
-        if (!found) continue;
-        if (isServerDisabled(state.config.mcpServers[server])) {
-          disabledMatch ??= { serverName: server, toolMeta: found };
-          continue;
-        }
-        serverName = server;
-        toolMeta = found;
-        break;
-      }
-    }
-    if (!toolMeta && disabledMatch) return disabledCallResult(disabledMatch.serverName, disabledMatch.toolMeta);
   }
 
   if (serverName && !toolMeta) {
     const connected = await lazyConnect(state, serverName, ownedSignal);
     if (connected) {
-      const match = getSingleToolMatch(state.toolMetadata.get(serverName), toolName);
-      if (match === "ambiguous") return ambiguousToolResult("call", toolName);
+      const match = getCandidateToolMatch(state.toolMetadata.get(serverName), toolName, serverName, state);
+      if (match === "ambiguous") return ambiguousServerToolResult("call", toolName, serverName);
       toolMeta = match;
     } else {
       const needsAuthConnection = state.manager.getConnection(serverName);
@@ -907,11 +1256,11 @@ export async function executeCall(
             clearFailure(state, serverName);
             const connectedAfterAuth = await lazyConnect(state, serverName, ownedSignal);
             if (connectedAfterAuth) {
-              const match = getSingleToolMatch(state.toolMetadata.get(serverName), toolName);
-              if (match === "ambiguous") return ambiguousToolResult("call", toolName);
+              const match = getCandidateToolMatch(state.toolMetadata.get(serverName), toolName, serverName, state);
+              if (match === "ambiguous") return ambiguousServerToolResult("call", toolName, serverName);
               toolMeta = match;
               if (!toolMeta) {
-                const suggestions = rankSuggestions(state, toolName, 5);
+                const suggestions = rankSuggestions(state, toolName, 5, serverName);
                 const suggestionText = suggestions.length > 0 ? ` Did you mean: ${suggestions.join(", ")}` : "";
                 return {
                   content: [{ type: "text" as const, text: `Tool "${toolName}" not found on "${serverName}" after reconnect.${suggestionText}` }],
@@ -985,7 +1334,7 @@ export async function executeCall(
         lazyExactMatches.push({ serverName: configuredServer, toolMeta: exactMatches[0]! });
         continue;
       }
-      const fallbackMatches = getToolMatches(metadata, toolName, false);
+      const fallbackMatches = getCandidateToolMatches(metadata, toolName, configuredServer, state);
       if (fallbackMatches.length > 1) return ambiguousToolResult("call", toolName);
       if (fallbackMatches.length === 1) lazyFallbackMatches.push({ serverName: configuredServer, toolMeta: fallbackMatches[0]! });
     }
@@ -1016,7 +1365,7 @@ export async function executeCall(
     } else {
       msg += ` Use mcp({ search: "..." }) to search.`;
     }
-    const suggestions = rankSuggestions(state, toolName, 5);
+    const suggestions = rankSuggestions(state, toolName, 5, serverOverride);
     if (suggestions.length > 0) msg += ` Did you mean: ${suggestions.join(", ")}`;
     return {
       content: [{ type: "text" as const, text: msg }],
@@ -1026,7 +1375,7 @@ export async function executeCall(
 
   const callIdentity = toolMeta.resourceUri
     ? { server: serverName, resourceUri: toolMeta.resourceUri }
-    : { server: serverName, tool: toolMeta.originalName };
+    : { server: serverName, tool: toolMeta.originalName, canonicalTool: toolMeta.name };
 
   let connection = state.manager.getConnection(serverName);
   if (connection?.status === "needs-auth") {
@@ -1100,21 +1449,21 @@ export async function executeCall(
           };
         }
       }
-      clearFailure(state, serverName);
       updateServerMetadata(state, serverName);
       updateMetadataCache(state, serverName);
-      notifyToolMetadataUpdated(state, serverName, "proxy-call-reconnect");
+      const restored = clearFailure(state, serverName, "proxy-call-reconnect");
+      if (!restored) notifyToolMetadataUpdated(state, serverName, "proxy-call-reconnect");
       markKeepAliveAfterConnect(state, serverName);
       updateStatusBar(state);
-      const match = getSingleToolMatch(state.toolMetadata.get(serverName), toolName);
-      if (match === "ambiguous") return ambiguousToolResult("call", toolName);
+      const match = getCandidateToolMatch(state.toolMetadata.get(serverName), toolName, serverName, state);
+      if (match === "ambiguous") return ambiguousServerToolResult("call", toolName, serverName);
       toolMeta = match;
       if (!toolMeta) {
         const available = getToolNames(state, serverName);
         const hint = available.length > 0
           ? `Available tools on "${serverName}": ${available.join(", ")}`
           : `Server "${serverName}" has no tools.`;
-        const suggestions = rankSuggestions(state, toolName, 5);
+        const suggestions = rankSuggestions(state, toolName, 5, serverName);
         const suggestionText = suggestions.length > 0 ? ` Did you mean: ${suggestions.join(", ")}` : "";
         return {
           content: [{ type: "text" as const, text: `Tool "${toolName}" not found on "${serverName}" after reconnect. ${hint}${suggestionText}` }],
@@ -1137,6 +1486,18 @@ export async function executeCall(
   }
 
   const normalizedArgs = toolMeta.resourceUri ? args ?? {} : normalizeToolArguments(args);
+  const validationError = toolMeta.resourceUri ? null : proxyArgumentValidationError(toolMeta.inputSchema, normalizedArgs);
+  if (validationError) {
+    const schemaText = `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}`;
+    const guarded = await guardMcpOutput(
+      [{ type: "text" as const, text: validationError }],
+      { ...resolveMcpOutputGuardOptions(state.config.settings), prefix: "Failed to call tool: ", suffix: schemaText },
+    );
+    return {
+      content: guarded.content,
+      details: { mode: "call", error: "call_failed", ...callIdentity, message: validationError, ...guardedMcpDetails(guarded) },
+    };
+  }
   const approval = await ensureToolCallApproved(
     state,
     serverName,
@@ -1162,7 +1523,12 @@ export async function executeCall(
   }
 
   let uiSession: UiSessionRuntime | null = null;
-  const requestOptions = state.manager.getRequestOptions?.(serverName, ownedSignal) ?? (ownedSignal ? { signal: ownedSignal } : undefined);
+  const requestOptions = withUiProgressBridge(
+    state.manager.getRequestOptions?.(serverName, ownedSignal) ?? (ownedSignal ? { signal: ownedSignal } : undefined),
+    state.ui,
+    serverName,
+    toolMeta.originalName,
+  );
 
   const outputGuardOptions = resolveMcpOutputGuardOptions(state.config.settings);
   const recoverAuthConnection = async () => {
@@ -1204,9 +1570,22 @@ export async function executeCall(
           onNeedsAuth: recoverAuthConnection,
         },
         serverName,
-        (conn) => conn.client.readResource({ uri: toolMeta.resourceUri! }, requestOptions),
+        async (conn) => {
+          const refreshRead = await state.manager.prepareResourceUse?.(serverName, toolMeta.resourceUri!, conn);
+          return conn.client.readResource(
+            { uri: toolMeta.resourceUri! },
+            refreshRead ? { ...requestOptions, cacheMode: "refresh" } : requestOptions,
+          );
+        },
       );
       const content = transformMcpResourceContents(result.contents ?? [], state.owner?.signal);
+      if (internalDelivery) {
+        throwIfAborted(ownedSignal);
+        internalDelivery.onSuccess(content.length > 0
+          ? content.filter(block => block.type === "text").map(block => block.text).join("\n")
+          : "(empty resource)");
+        return { content: [], details: { mode: "call", ...callIdentity } };
+      }
       const guarded = await guardMcpOutput(content.length > 0 ? content : [{ type: "text" as const, text: "(empty resource)" }], outputGuardOptions);
       return {
         content: guarded.content,
@@ -1234,22 +1613,40 @@ export async function executeCall(
         onNeedsAuth: recoverAuthConnection,
       },
       serverName,
-      (conn) => abortable(conn.client.callTool({
-        name: toolMeta.originalName,
-        arguments: normalizedArgs,
-        _meta: uiSession?.requestMeta,
-      }, requestOptions), ownedSignal),
+      async (conn) => {
+        await state.manager.ensureListen?.(serverName, conn);
+        if (conn.taskSession) {
+          return await callToolViaTaskSession(conn.taskSession, {
+            name: toolMeta.originalName,
+            args: normalizedArgs ?? {},
+            meta: uiSession?.requestMeta,
+            signal: ownedSignal,
+            requestTimeoutMs: requestOptions?.timeout,
+          }) as unknown as ClientCallToolResult;
+        }
+        return abortable(conn.client.callTool({
+          name: toolMeta.originalName,
+          arguments: normalizedArgs,
+          _meta: uiSession?.requestMeta,
+        }, requestOptions), ownedSignal);
+      },
     );
 
     if (toolMeta.uiResourceUri) {
       uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/client").CallToolResult);
+    }
 
+    if (!result.isError && internalDelivery) {
+      throwIfAborted(ownedSignal);
+      internalDelivery.onSuccess(result);
+      return { content: [], details: { mode: "call", ...callIdentity } };
+    }
+
+    if (toolMeta.uiResourceUri) {
       if (result.isError) {
-        const mcpContent = (result.content ?? []) as McpContent[];
-        const content = transformMcpContent(mcpContent, state.owner?.signal);
+        const content = resolveMcpResultContent(result as Record<string, unknown>, state.owner?.signal);
         const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
-        const schemaText = toolMeta.inputSchema ? `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}` : "";
-        const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", suffix: schemaText, emptyTextFallback: "Tool execution failed", rawMcpResult: result });
+        const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", emptyTextFallback: "Tool execution failed", rawMcpResult: result });
         return {
           content: guarded.content,
           details: { mode: "call", error: "tool_error", ...callIdentity, ...guardedMcpDetails(guarded) },
@@ -1274,11 +1671,9 @@ export async function executeCall(
     }
 
     if (result.isError) {
-      const mcpContent = (result.content ?? []) as McpContent[];
-      const content = transformMcpContent(mcpContent, state.owner?.signal);
+      const content = resolveMcpResultContent(result as Record<string, unknown>, state.owner?.signal);
       const outputContent = content.length > 0 ? content : [{ type: "text" as const, text: "(empty result)" }];
-      const schemaText = toolMeta.inputSchema ? `\n\nExpected parameters:\n${formatSchema(toolMeta.inputSchema)}` : "";
-      const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", suffix: schemaText, emptyTextFallback: "Tool execution failed", rawMcpResult: result });
+      const guarded = await guardMcpOutput(outputContent, { ...outputGuardOptions, prefix: "Error: ", emptyTextFallback: "Tool execution failed", rawMcpResult: result });
       return {
         content: guarded.content,
         details: { mode: "call", error: "tool_error", ...callIdentity, ...guardedMcpDetails(guarded) },
@@ -1310,6 +1705,14 @@ export async function executeCall(
       return {
         content: [{ type: "text" as const, text: message }],
         details: { mode: "call", error: "url_elicitation_required", ...callIdentity, action },
+      };
+    }
+    const inputRequired = getInputRequiredNeedsUiDetails(error, callIdentity);
+    if (inputRequired) {
+      uiSession?.sendToolCancelled(inputRequired.message);
+      return {
+        content: [{ type: "text" as const, text: inputRequired.message }],
+        details: { mode: "call", ...inputRequired },
       };
     }
     const message = error instanceof Error ? error.message : String(error);

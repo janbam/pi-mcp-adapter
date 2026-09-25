@@ -72,16 +72,19 @@ beforeEach(() => {
 });
 
 describe("cross-server collision scan is skipped without tool filters", () => {
-  it("buildProxyDescription does not generate candidates without filters", () => {
-    const { config, cache } = makeTwoServerConfig();
-    buildProxyDescription(config, cache, []);
-    expect(mockedGetToolNameCandidates).not.toHaveBeenCalled();
+  it("buildProxyDescription tells the model search-mode tools activate on search", () => {
+    const withSearch = buildProxyDescription({ settings: {}, mcpServers: { demo: { command: "demo", directTools: "search" }, other: { command: "o" } } });
+    expect(withSearch).toContain("Search-mode servers (demo)");
+    expect(withSearch).toContain("mcp({ search }) matches them");
+    expect(withSearch).not.toContain("mcp({ tool }) calls them");
+    const without = buildProxyDescription({ settings: {}, mcpServers: { other: { command: "o" } } });
+    expect(without).not.toContain("Search-mode servers");
   });
 
-  it("buildProxyDescription builds filtered candidates once", () => {
-    const { config, cache } = makeLargeFilteredConfig(40);
-    buildProxyDescription(config, cache, []);
-    expect(mockedGetToolNameCandidates).toHaveBeenCalledTimes(40);
+  it("buildProxyDescription never generates candidates — it is config-pure", () => {
+    const { config } = makeLargeFilteredConfig(40);
+    buildProxyDescription(config);
+    expect(mockedGetToolNameCandidates).not.toHaveBeenCalled();
   });
 
   it("resolveDirectTools does not generate candidates without filters", () => {
