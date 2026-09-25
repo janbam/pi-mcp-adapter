@@ -99,7 +99,7 @@ describe("syncNamespaceProxyTools", () => {
     syncNamespaceProxyTools({
       config: {
         mcpServers: {
-          Exa: { command: "Exa", description: " Web search\n\tand advanced web search via Exa " },
+          Exa: { command: "Exa", description: " Web search\n\tand advanced web search via Exa. " },
           Void: { command: "Void" },
           Blank: { command: "Blank", description: "  \n " },
         },
@@ -123,7 +123,8 @@ describe("syncNamespaceProxyTools", () => {
       return { description: tool.description, promptSnippet: tool.promptSnippet };
     };
     expect(texts("mcp__Exa")).toEqual({
-      promptSnippet: "MCP namespace proxy for Exa: Web search and advanced web search via Exa",
+      promptSnippet: "MCP namespace proxy for Exa: Web search and advanced web search via Exa.",
+      // A sentence-style description must not produce ".." before the fixed remainder.
       description: `Namespace-proxy for MCP server "Exa": Web search and advanced web search via Exa. ${plainText}`,
     });
     // Byte-identical to the pre-description output, for absent and blank values alike.

@@ -56,7 +56,8 @@ function namespaceProxyCandidate(
     toolName,
     promptSnippet: `MCP namespace proxy for ${serverName}${serverDescription ? `: ${serverDescription}` : ""}`,
     description:
-      `Namespace-proxy for MCP server "${serverName}"${serverDescription ? `: ${serverDescription}` : ""}. ` +
+      // Drop one trailing period so a sentence-style description doesn't end in "..".
+      `Namespace-proxy for MCP server "${serverName}"${serverDescription ? `: ${serverDescription.replace(/\.$/, "")}` : ""}. ` +
       `Forwards \`{tool, args}\` through the adapter's executeCall, so it inherits ` +
       `the same auth / lifecycle / output-guard rules as the \`mcp\` proxy.`,
   };
