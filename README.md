@@ -282,6 +282,7 @@ In the configuration examples below, `30000` is illustrative only. If `requestTi
     "my-server": {
       "command": "npx",
       "args": ["-y", "some-mcp-server"],
+      "description": "Searches the team wiki and issue tracker",
       "lifecycle": "lazy",
       "idleTimeout": 10,
       "requestTimeoutMs": 30000
