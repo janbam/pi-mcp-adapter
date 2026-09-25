@@ -91,6 +91,51 @@ describe("syncNamespaceProxyTools", () => {
     expect(tool.execute).toBeTypeOf("function");
   });
 
+  it("adds a configured description to the proxy snippet and description, and keeps the name-only texts otherwise", async () => {
+    const { syncNamespaceProxyTools } = await importSync();
+    const { pi, registered } = makePi();
+    const plainText = "Forwards `{tool, args}` through the adapter's executeCall, so it inherits the same auth / lifecycle / output-guard rules as the `mcp` proxy.";
+
+    syncNamespaceProxyTools({
+      config: {
+        mcpServers: {
+          Exa: { command: "Exa", description: " Web search\n\tand advanced web search via Exa. " },
+          Void: { command: "Void" },
+          Blank: { command: "Blank", description: "  \n " },
+        },
+      },
+      cache: CACHE_SHAPE([
+        ["Exa", { tools: [{ name: "search" }] }],
+        ["Void", { tools: [{ name: "stare" }] }],
+        ["Blank", { tools: [{ name: "noop" }] }],
+      ]),
+      envOverride: null,
+      existingDirectNames: new Set(),
+      existingNamespaceNames: new Set(),
+      pi,
+      getState: () => null,
+      getInitPromise: () => null,
+      getPiTools: () => [],
+    });
+
+    const texts = (name: string) => {
+      const tool = registered.get(name) as unknown as { description: string; promptSnippet: string };
+      return { description: tool.description, promptSnippet: tool.promptSnippet };
+    };
+    expect(texts("mcp__Exa")).toEqual({
+      promptSnippet: "MCP namespace proxy for Exa: Web search and advanced web search via Exa.",
+      // A sentence-style description must not produce ".." before the fixed remainder.
+      description: `Namespace-proxy for MCP server "Exa": Web search and advanced web search via Exa. ${plainText}`,
+    });
+    // Byte-identical to the pre-description output, for absent and blank values alike.
+    for (const server of ["Void", "Blank"]) {
+      expect(texts(`mcp__${server}`)).toEqual({
+        promptSnippet: `MCP namespace proxy for ${server}`,
+        description: `Namespace-proxy for MCP server "${server}". ${plainText}`,
+      });
+    }
+  });
+
   it("does not register namespace proxies when namespaceProxyTools is false", async () => {
     const { syncNamespaceProxyTools } = await importSync();
     const { pi } = makePi();

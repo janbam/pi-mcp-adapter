@@ -1,6 +1,6 @@
 import { Check, Errors } from "typebox/value";
 import type { DirectToolSpec, McpConfig, ToolPrefix } from "./types.ts";
-import { createToolSelectorCandidateIndex, formatToolName, getToolNameCandidates, isServerDisabled, isToolAllowed, resolveToolPrefix, resolveUniqueNameOwnership } from "./types.ts";
+import { createToolSelectorCandidateIndex, formatToolName, getServerDescription, getToolNameCandidates, isServerDisabled, isToolAllowed, resolveToolPrefix, resolveUniqueNameOwnership } from "./types.ts";
 import type { MetadataCache } from "./metadata-cache.ts";
 import { isServerCacheValid, parseDirectToolSelectors } from "./metadata-cache.ts";
 export { getMissingConfiguredDirectToolServers } from "./metadata-cache.ts";
@@ -204,7 +204,12 @@ export function buildProxyDescription(config: McpConfig): string {
 
   const serverNames = Object.keys(config.mcpServers)
     .filter((serverName) => !isServerDisabled(config.mcpServers[serverName]));
-  if (serverNames.length > 0) {
+  // Keep the compact one-line list unless a configured description needs room.
+  // Then list every enabled server, in config order, on its own line.
+  const servers = serverNames.map((serverName) => ({ serverName, description: getServerDescription(config.mcpServers[serverName]) }));
+  if (servers.some(({ description }) => description !== undefined)) {
+    desc += `\nServers:\n${servers.map(({ serverName, description }) => `- ${serverName}${description ? `: ${description}` : ""}\n`).join("")}`;
+  } else if (serverNames.length > 0) {
     desc += `\nServers: ${serverNames.join(", ")}\n`;
   }
 

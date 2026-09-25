@@ -1,7 +1,7 @@
 import type { AgentToolResult, ExtensionAPI, ToolInfo } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { McpExtensionState } from "./state.ts";
-import { isServerDisabled, type McpConfig } from "./types.ts";
+import { getServerDescription, isServerDisabled, type McpConfig } from "./types.ts";
 import { isServerCacheValid, type MetadataCache } from "./metadata-cache.ts";
 import { createMcpProxyToolCallRenderer, createMcpToolResultRenderer, resolveMcpToolRenderOptions, type McpToolRenderOptions, type RenderTheme, type McpToolRenderContext } from "./tool-result-renderer.ts";
 export { namespaceProxyName } from "./mcp-references.ts";
@@ -23,10 +23,15 @@ import { hasCallableCachedTargets, isMcpServerDirectlyRegistered, namespaceProxy
  * `slow-mode` against proxy-only servers without flipping `directTools: true`.
  */
 
+/**
+ * One namespace proxy to register. `description` and `promptSnippet` are
+ * derived from config only, so re-registration keeps them byte-stable.
+ */
 export interface NamespaceProxySpec {
   serverName: string;
   toolName: string;
   description: string;
+  promptSnippet: string;
 }
 
 function namespaceProxyCandidate(
@@ -43,11 +48,16 @@ function namespaceProxyCandidate(
   if (!entry || !isServerCacheValid(entry, definition) || !hasCallableCachedTargets(entry, definition)) return null;
   const toolName = namespaceProxyName(serverName);
   if (existingDirectNames.has(toolName)) return null;
+  // Only the configured description extends the texts. Without one they stay
+  // byte-identical to the name-only form, with no metadata-derived fallback.
+  const serverDescription = getServerDescription(definition);
   return {
     serverName,
     toolName,
+    promptSnippet: `MCP namespace proxy for ${serverName}${serverDescription ? `: ${serverDescription}` : ""}`,
     description:
-      `Namespace-proxy for MCP server "${serverName}". ` +
+      // Drop one trailing period so a sentence-style description doesn't end in "..".
+      `Namespace-proxy for MCP server "${serverName}"${serverDescription ? `: ${serverDescription.replace(/\.$/, "")}` : ""}. ` +
       `Forwards \`{tool, args}\` through the adapter's executeCall, so it inherits ` +
       `the same auth / lifecycle / output-guard rules as the \`mcp\` proxy.`,
   };
@@ -246,7 +256,7 @@ function registerNamespaceProxyTool(
     name: spec.toolName,
     label: `MCP: ${spec.serverName}`,
     description: spec.description,
-    promptSnippet: `MCP namespace proxy for ${spec.serverName}`,
+    promptSnippet: spec.promptSnippet,
     parameters,
     renderShell,
     renderCall: createNamespaceRenderCall(renderOptions, spec.serverName),
